@@ -1,0 +1,51 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /citester
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /dist
+    schedule:
+      interval: daily
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /tests/attestation-tagged
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /tests/attestation-untagged
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /tests/bare-oci11-referrer
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /tests/cosign-oci11
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /tests/cosign
+    schedule:
+      interval: daily
+
+  - package-ecosystem: docker
+    directory: /tests/shared-images-untagged
+    schedule:
+      interval: daily
