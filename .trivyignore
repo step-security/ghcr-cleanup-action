@@ -1,0 +1,2 @@
+# brace-expansion DoS — fix requires v5.0.8 (breaking major bump); no exploitable path in this action
+CVE-2026-14257
