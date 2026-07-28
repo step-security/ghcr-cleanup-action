@@ -5,8 +5,6 @@
 [![GitHub Super-Linter](https://github.com/step-security/ghcr-cleanup-action/actions/workflows/linter.yml/badge.svg)](https://github.com/super-linter/super-linter)
 ![CI](https://github.com/step-security/ghcr-cleanup-action/actions/workflows/ci.yml/badge.svg)
 [![Check dist/](https://github.com/step-security/ghcr-cleanup-action/actions/workflows/check-dist.yml/badge.svg)](https://github.com/step-security/ghcr-cleanup-action/actions/workflows/check-dist.yml)
-[![CodeQL](https://github.com/step-security/ghcr-cleanup-action/actions/workflows/codeql-analysis.yml/badge.svg)](https://github.com/step-security/ghcr-cleanup-action/actions/workflows/codeql-analysis.yml)
-![Coverage](./badges/coverage.svg)
 
 A GitHub Action that deletes container images from the GitHub Container Registry
 (ghcr.io). It safely handles multi-architecture images, attestation and Sigstore
@@ -124,7 +122,7 @@ jobs:
       - uses: step-security/ghcr-cleanup-action@v1
         with:
           token: ${{ secrets.MY_PAT }}
-          owner: dataaxiom
+          owner: my-org
           package: tiecd
           delete-tags: '^mytag[12]$'
           use-regex: true

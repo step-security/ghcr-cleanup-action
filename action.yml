@@ -4,7 +4,7 @@ description: >
   Delete untagged/tagged images from the GitHub Container Registry. Supports
   multi-architecture and attestation images.
 
-author: Dataaxiom Inc
+author: 'step-security'
 
 branding:
   icon: trash-2
