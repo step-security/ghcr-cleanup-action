@@ -1,0 +1,4 @@
+dist/
+citester/
+node_modules/
+coverage/

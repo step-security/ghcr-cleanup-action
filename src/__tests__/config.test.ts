@@ -1,0 +1,596 @@
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  vi,
+  type MockedFunction,
+  type MockedClass
+} from 'vitest'
+import * as core from '@actions/core'
+import humanInterval from 'human-interval'
+import { Config, LogLevel, buildConfig } from '../config'
+import { OctokitClient } from '../octokit-client'
+
+// Mock dependencies
+vi.mock('@actions/core')
+vi.mock('../octokit-client')
+vi.mock('human-interval')
+
+// Mock environment variables
+const originalEnv = process.env
+
+describe('Config', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    process.env = { ...originalEnv }
+  })
+
+  afterEach(() => {
+    process.env = originalEnv
+  })
+
+  describe('Config class', () => {
+    it('should initialize with default values', () => {
+      const config = new Config()
+
+      expect(config.tokenOwnsPackage).toBe(false)
+      expect(config.repoType).toBe('Organization')
+      expect(config.owner).toBe('')
+      expect(config.repository).toBe('')
+      expect(config.package).toBe('')
+      expect(config.token).toBe('')
+      expect(config.logLevel).toBe(LogLevel.INFO)
+      expect(config.expandPackages).toBeUndefined()
+      expect(config.defaultPackageUsed).toBe(false)
+      expect(config.deleteTags).toBeUndefined()
+      expect(config.excludeTags).toBeUndefined()
+      expect(config.olderThanReadable).toBeUndefined()
+      expect(config.olderThan).toBeUndefined()
+      expect(config.deleteUntagged).toBeUndefined()
+      expect(config.deleteGhostImages).toBeUndefined()
+      expect(config.deletePartialImages).toBeUndefined()
+      expect(config.deleteOrphanedImages).toBeUndefined()
+      expect(config.keepNuntagged).toBeUndefined()
+      expect(config.keepNtagged).toBeUndefined()
+      expect(config.dryRun).toBeUndefined()
+      expect(config.validate).toBeUndefined()
+      expect(config.useRegex).toBeUndefined()
+      expect(config.registryUrl).toBeUndefined()
+      expect(config.githubApiUrl).toBeUndefined()
+    })
+  })
+
+  describe('buildConfig', () => {
+    let mockGetInput: MockedFunction<typeof core.getInput>
+    let mockGetBooleanInput: MockedFunction<typeof core.getBooleanInput>
+    let mockInfo: MockedFunction<typeof core.info>
+    let mockStartGroup: MockedFunction<typeof core.startGroup>
+    let mockEndGroup: MockedFunction<typeof core.endGroup>
+    let mockOctokitClient: MockedClass<typeof OctokitClient>
+
+    beforeEach(() => {
+      mockGetInput = core.getInput as MockedFunction<typeof core.getInput>
+      mockGetBooleanInput = core.getBooleanInput as MockedFunction<
+        typeof core.getBooleanInput
+      >
+      mockInfo = core.info as MockedFunction<typeof core.info>
+      mockStartGroup = core.startGroup as MockedFunction<typeof core.startGroup>
+      mockEndGroup = core.endGroup as MockedFunction<typeof core.endGroup>
+      mockOctokitClient = vi.mocked(OctokitClient)
+
+      // Setup default mocks
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          owner: 'test-owner',
+          repository: 'test-repo',
+          package: 'test-package'
+        }
+        return inputs[name] || ''
+      })
+
+      mockGetBooleanInput.mockReturnValue(false)
+
+      // Mock OctokitClient — buildConfig now uses these two methods
+      // instead of getRepository (issue #117).
+      mockOctokitClient.prototype.getOwnerType = vi
+        .fn()
+        .mockResolvedValue('Organization')
+      mockOctokitClient.prototype.getAuthenticatedUserLogin = vi
+        .fn()
+        .mockResolvedValue(null)
+    })
+
+    it('should build config with basic inputs', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+
+      const config = await buildConfig()
+
+      expect(config.token).toBe('test-token')
+      expect(config.owner).toBe('test-owner')
+      expect(config.repository).toBe('test-repo')
+      expect(config.package).toBe('test-package')
+      expect(config.tokenOwnsPackage).toBe(false)
+      expect(config.repoType).toBe('Organization')
+    })
+
+    it('should auto-populate from GITHUB_REPOSITORY env var', async () => {
+      process.env.GITHUB_REPOSITORY = 'auto-owner/auto-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        if (name === 'token') return 'test-token'
+        return '' // Return empty for owner, repository, package
+      })
+
+      const config = await buildConfig()
+
+      expect(config.owner).toBe('auto-owner')
+      expect(config.repository).toBe('auto-repo')
+      expect(config.package).toBe('auto-repo')
+      expect(config.defaultPackageUsed).toBe(true)
+    })
+
+    it('should throw error when GITHUB_REPOSITORY is missing', async () => {
+      delete process.env.GITHUB_REPOSITORY
+
+      await expect(buildConfig()).rejects.toThrow(
+        'GITHUB_REPOSITORY is not set'
+      )
+    })
+
+    it('should throw error when GITHUB_REPOSITORY is malformed', async () => {
+      process.env.GITHUB_REPOSITORY = 'malformed'
+
+      await expect(buildConfig()).rejects.toThrow(
+        'Error parsing GITHUB_REPOSITORY: malformed'
+      )
+    })
+
+    it('should throw error when package and packages are both set', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          package: 'package1',
+          packages: 'package2'
+        }
+        return inputs[name] || ''
+      })
+
+      await expect(buildConfig()).rejects.toThrow(
+        'package and packages cannot be used at the same time, use either one'
+      )
+    })
+
+    it('should handle packages input as fallback for package', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          packages: 'package1,package2'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.package).toBe('package1,package2')
+    })
+
+    it('should auto-enable expand-packages for wildcard patterns', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          package: 'test-*'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.expandPackages).toBe(true)
+      expect(mockInfo).toHaveBeenCalledWith(
+        expect.stringContaining('auto enabling expand-packages to true')
+      )
+    })
+
+    it('should handle delete-tags and tags inputs', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-tags': 'v1.*,v2.*'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.deleteTags).toBe('v1.*,v2.*')
+    })
+
+    it('should throw error when tags and delete-tags are both set', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          tags: 'v1.*',
+          'delete-tags': 'v2.*'
+        }
+        return inputs[name] || ''
+      })
+
+      await expect(buildConfig()).rejects.toThrow(
+        'tags and delete-tags cannot be used at the same time, use either one'
+      )
+    })
+
+    it('should handle keep-n-tagged and keep-n-untagged', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'keep-n-tagged': '5',
+          'keep-n-untagged': '3'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.keepNtagged).toBe(5)
+      expect(config.keepNuntagged).toBe(3)
+    })
+
+    it('should throw error for invalid keep-n-tagged value', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'keep-n-tagged': 'invalid'
+        }
+        return inputs[name] || ''
+      })
+
+      await expect(buildConfig()).rejects.toThrow('keep-n-tagged is not number')
+    })
+
+    it('should throw error for negative keep-n-tagged value', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'keep-n-tagged': '-1'
+        }
+        return inputs[name] || ''
+      })
+
+      await expect(buildConfig()).rejects.toThrow('keep-n-tagged is negative')
+    })
+
+    it('should default deleteUntagged to true when no options are set', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        if (name === 'token') return 'test-token'
+        return ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.deleteUntagged).toBe(true)
+    })
+
+    it('should handle boolean inputs correctly', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-untagged': 'true',
+          'delete-ghost-images': 'true',
+          'delete-partial-images': 'true',
+          'delete-orphaned-images': 'true',
+          'dry-run': 'true',
+          validate: 'true',
+          'use-regex': 'true'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockReturnValue(true)
+
+      const config = await buildConfig()
+
+      expect(config.deleteUntagged).toBe(true)
+      expect(config.deleteGhostImages).toBe(true)
+      expect(config.deletePartialImages).toBe(true)
+      expect(config.deleteOrphanedImages).toBe(true)
+      expect(config.dryRun).toBe(true)
+      expect(config.validate).toBe(true)
+      expect(config.useRegex).toBe(true)
+    })
+
+    it('rejects ReDoS-prone delete-tags when use-regex is enabled', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-tags': '(a+)+$',
+          'use-regex': 'true'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockImplementation(
+        (name: string) => name === 'use-regex'
+      )
+
+      await expect(buildConfig()).rejects.toThrow(/delete-tags.*ReDoS-prone/)
+    })
+
+    it('rejects ReDoS-prone exclude-tags when use-regex is enabled', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'exclude-tags': '(.*)+$',
+          'use-regex': 'true'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockImplementation(
+        (name: string) => name === 'use-regex'
+      )
+
+      await expect(buildConfig()).rejects.toThrow(/exclude-tags.*ReDoS-prone/)
+    })
+
+    it('skips regex safety checks when skip-regex-checks is enabled', async () => {
+      // A ReDoS-prone pattern that would normally be rejected must pass
+      // through untouched when the author opts out via skip-regex-checks.
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-tags': '(a+)+$',
+          'use-regex': 'true',
+          'skip-regex-checks': 'true'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockImplementation(
+        (name: string) => name === 'use-regex' || name === 'skip-regex-checks'
+      )
+
+      const config = await buildConfig()
+      expect(config.useRegex).toBe(true)
+      expect(config.skipRegexChecks).toBe(true)
+      expect(config.deleteTags).toBe('(a+)+$')
+    })
+
+    it('does NOT validate delete-tags as regex when use-regex is false', async () => {
+      // Without use-regex, delete-tags is a wildcard pattern, not a regex,
+      // so the (a+)+ string is a literal — must not be rejected.
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-tags': '(a+)+$'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockReturnValue(false)
+
+      const config = await buildConfig()
+      expect(config.deleteTags).toBe('(a+)+$')
+      expect(config.useRegex).toBeFalsy()
+    })
+
+    it('should handle log levels correctly', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'log-level': 'debug'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.logLevel).toBe(LogLevel.DEBUG)
+    })
+
+    it('should handle registry-url with trailing slash', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'registry-url': 'https://custom.registry.com'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.registryUrl).toBe('https://custom.registry.com/')
+    })
+
+    it('should handle github-api-url without trailing slash', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'github-api-url': 'https://custom.github.com/'
+        }
+        return inputs[name] || ''
+      })
+
+      const config = await buildConfig()
+
+      expect(config.githubApiUrl).toBe('https://custom.github.com')
+    })
+
+    it('should fetch owner type and token identity from OctokitClient', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockOctokitClient.prototype.getOwnerType = vi
+        .fn()
+        .mockResolvedValue('User')
+      mockOctokitClient.prototype.getAuthenticatedUserLogin = vi
+        .fn()
+        .mockResolvedValue('test-owner')
+
+      const config = await buildConfig()
+
+      expect(config.repoType).toBe('User')
+      expect(config.tokenOwnsPackage).toBe(true)
+      expect(mockOctokitClient.prototype.getOwnerType).toHaveBeenCalledWith(
+        'test-owner'
+      )
+      expect(
+        mockOctokitClient.prototype.getAuthenticatedUserLogin
+      ).toHaveBeenCalled()
+    })
+
+    it('compares token login to owner case-insensitively', async () => {
+      // GitHub canonicalises login casing; users frequently write owners
+      // in lowercase. The compare must not be case-sensitive.
+      process.env.GITHUB_REPOSITORY = 'Test-Owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          owner: 'TEST-OWNER',
+          package: 'pkg'
+        }
+        return inputs[name] || ''
+      })
+      mockOctokitClient.prototype.getOwnerType = vi
+        .fn()
+        .mockResolvedValue('User')
+      mockOctokitClient.prototype.getAuthenticatedUserLogin = vi
+        .fn()
+        .mockResolvedValue('test-owner')
+
+      const config = await buildConfig()
+
+      expect(config.tokenOwnsPackage).toBe(true)
+    })
+
+    it('sets tokenOwnsPackage=false when token login is null', async () => {
+      // Happens for GitHub App tokens or scope-restricted PATs where
+      // GET /user returns nothing usable. Should fall through to the
+      // forUser endpoint rather than authenticated-user.
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockOctokitClient.prototype.getOwnerType = vi
+        .fn()
+        .mockResolvedValue('User')
+      mockOctokitClient.prototype.getAuthenticatedUserLogin = vi
+        .fn()
+        .mockResolvedValue(null)
+
+      const config = await buildConfig()
+
+      expect(config.tokenOwnsPackage).toBe(false)
+    })
+
+    it('no longer requires repository to be set (#117)', async () => {
+      // Cross-account workflows where the target package isn't linked to
+      // any repo should not trip the old "repository is not set" throw.
+      process.env.GITHUB_REPOSITORY = 'ownerC/repoC'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          owner: 'ownerT',
+          package: 'pkgT'
+          // no repository input, no GITHUB_REPOSITORY fallback that matches
+        }
+        return inputs[name] || ''
+      })
+      mockOctokitClient.prototype.getOwnerType = vi
+        .fn()
+        .mockResolvedValue('Organization')
+      mockOctokitClient.prototype.getAuthenticatedUserLogin = vi
+        .fn()
+        .mockResolvedValue(null)
+
+      await expect(buildConfig()).resolves.toBeDefined()
+    })
+
+    it('should print runtime configuration', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+
+      await buildConfig()
+
+      expect(mockStartGroup).toHaveBeenCalledWith('Runtime configuration')
+      expect(mockEndGroup).toHaveBeenCalled()
+    })
+
+    it('should throw error when delete-untagged and keep-n-untagged are both set', async () => {
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-untagged': 'true',
+          'keep-n-untagged': '3'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockImplementation((name: string) => {
+        return name === 'delete-untagged'
+      })
+
+      await expect(buildConfig()).rejects.toThrow(
+        'delete-untagged and keep-n-untagged cannot be set at the same time'
+      )
+    })
+
+    it('should throw when keep-n-untagged is 0 and delete-untagged is set', async () => {
+      // Regression: previously `if (config.keepNuntagged && ...)` short-circuited
+      // on 0, so this contradictory config was silently accepted.
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'delete-untagged': 'true',
+          'keep-n-untagged': '0'
+        }
+        return inputs[name] || ''
+      })
+      mockGetBooleanInput.mockImplementation((name: string) => {
+        return name === 'delete-untagged'
+      })
+
+      await expect(buildConfig()).rejects.toThrow(
+        'delete-untagged and keep-n-untagged cannot be set at the same time'
+      )
+    })
+
+    it('should throw when older-than cannot be parsed', async () => {
+      // Regression: humanInterval returns undefined for unparsable strings;
+      // the validator must treat that as fatal rather than silently skipping
+      // the age filter.
+      process.env.GITHUB_REPOSITORY = 'test-owner/test-repo'
+      const mockHumanInterval = vi.mocked(humanInterval)
+      mockHumanInterval.mockReturnValueOnce(undefined)
+      mockGetInput.mockImplementation((name: string) => {
+        const inputs: Record<string, string> = {
+          token: 'test-token',
+          'older-than': 'gibberish'
+        }
+        return inputs[name] || ''
+      })
+
+      await expect(buildConfig()).rejects.toThrow(
+        /older-than value "gibberish" is not a valid interval/
+      )
+    })
+  })
+
+  describe('LogLevel enum', () => {
+    it('should have correct values', () => {
+      expect(LogLevel.ERROR).toBe(1)
+      expect(LogLevel.WARN).toBe(2)
+      expect(LogLevel.INFO).toBe(3)
+      expect(LogLevel.DEBUG).toBe(4)
+    })
+  })
+})

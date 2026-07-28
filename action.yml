@@ -1,0 +1,159 @@
+name: Ghcr.io Cleanup Action
+
+description: >
+  Delete untagged/tagged images from the GitHub Container Registry. Supports
+  multi-architecture and attestation images.
+
+author: Dataaxiom Inc
+
+branding:
+  icon: trash-2
+  color: green
+
+inputs:
+  # General Options
+  token:
+    description: >
+      Token to authenticate with the ghcr.io registry and the GitHub API
+    required: true
+    default: ${{ github.token }}
+
+  owner:
+    description: >
+      Owner of the package (user or organization). Defaults to project owner
+    required: false
+
+  repository:
+    description: >
+      Optional. Used only for diagnostic log strings; defaults to the calling
+      workflow's repository name. The cleanup logic determines the package's
+      owner type and your token's identity directly, so this input no longer
+      affects which packages are touched. Safe to omit (especially for
+      cross-account cleanup where the target package isn't linked to any
+      repository).
+    required: false
+
+  package:
+    description: >
+      Comma-separated list of packages to cleanup. Support dynamic packages
+      (wildcard or regular expression) by enabling the expand-packages option.
+    required: false
+
+  packages:
+    description: >
+      Alternative name for package option
+    required: false
+
+  expand-packages:
+    description: >
+      Enable wildcard or regular expression support on the package(s) option to
+      support dynamic package selection. Requires use of a Personal Access Token
+      (PAT) for the token value.
+    required: false
+
+  # Cleanup Options
+
+  delete-tags:
+    description: >
+      Comma-separated list of tags to delete (supports wildcard syntax), can be
+      abbreviated as `tags`. A regular expression selector can be used instead
+      by setting the `use-regex` option to true
+    required: false
+
+  tags:
+    description: >
+      Short form of `delete-tags` input option
+    required: false
+
+  exclude-tags:
+    description: >
+      Comma-separated list of tags strictly to be preserved/excluded from
+      deletion (supports wildcard syntax). A regular expression selector can be
+      used instead by setting the `use-regex` option to true
+    required: false
+
+  keep-n-untagged:
+    description: >
+      Number of untagged images to keep (sorted by date, keeping newest)
+    required: false
+
+  keep-n-tagged:
+    description: >
+      Number of tagged images to keep (sorted by date, keeping newest)
+    required: false
+
+  delete-untagged:
+    description: >
+      Delete all untagged images. This option is set to true when no other
+      delete or keep options are set (true/false)
+    required: false
+
+  delete-ghost-images:
+    description: >
+      Delete multi architecture images where all underlying platform images are
+      missing (true/false) Default: false
+    required: false
+
+  delete-partial-images:
+    description: >
+      Delete multi architecture images where some (but not all) underlying
+      platform images are missing (true/false) Default: false
+    required: false
+
+  delete-orphaned-images:
+    description: >
+      Delete orphaned images (referrers/cosign etc) where the parent image
+      doesn't exist. Uses a tagged based check.
+    required: false
+
+  older-than:
+    description: >
+      Only include packages for processing that are older than this value. Use
+      the following format samples: 50 seconds, 15 days, 6 months, 2 years
+    required: false
+
+  # Additional Options
+
+  use-regex:
+    description: >
+      Use a regex expression in place of wildcard matcher for package,
+      delete-tags and exclude-tags options (true/false) Default: false
+    required: false
+
+  skip-regex-checks:
+    description: >
+      Skip the safety checks (length cap and ReDoS heuristic) applied to
+      user-supplied regex patterns when use-regex is true. Set to true only if
+      you intentionally need a very large or complex pattern (true/false)
+      Default: false
+    required: false
+
+  validate:
+    description: >
+      Validate all multi-architecture images manifests by checking their digests
+      are present in the registry (true/false) Default: false
+    required: false
+
+  dry-run:
+    description: >
+      Simulate action - does not remove any packages (true/false) Default: false
+    required: false
+
+  log-level:
+    description: >
+      Log level (error/warn/info/debug) Default: info
+    required: false
+
+  registry-url:
+    description: >
+      Container registry URL (defaults: https://ghcr.io)
+    required: false
+
+  github-api-url:
+    description: >
+      GitHub API URL (defaults: https://api.github.com)
+    required: false
+
+runs:
+  using: node24
+  main: dist/index.js

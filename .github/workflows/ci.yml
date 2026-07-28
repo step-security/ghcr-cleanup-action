@@ -1,0 +1,1286 @@
+name: Integration Tests
+
+on:
+  push:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# Trigger model:
+#   push:                    fires on direct upstream pushes (e.g. maintainer
+#                            committing to main). Auto-CI, no approval gate.
+#   pull_request_target:     fires on fork PRs. Default checkout would point
+#                            at base, so each job that runs PR code overrides
+#                            with `ref: ${{ github.event.pull_request.head.sha
+#                            || github.sha }}` — head sha on PRs, pushed sha
+#                            on push events.
+#
+# A single `pr-integration-tests-gate` job carries the `environment:` for
+# fork-PR approval. The matrix and downstream jobs `needs:` it but don't
+# carry the environment themselves — without this hoist each matrix entry
+# (1a/1b/2a/2b/...) would require its own individual approval, since
+# environment protection rules apply per-job and matrix entries count as
+# separate jobs. The gate's conditional expression resolves to '' on push
+# events, so the job runs immediately without an approval prompt on
+# direct maintainer pushes; on pull_request_target it uses the
+# `pr-integration-tests` environment and waits for a reviewer.
+
+concurrency:
+  group: ci-tests
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  general-tests:
+    name: General Tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        id: setup-node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install Dependencies
+        id: npm-ci
+        run: npm ci
+
+      - name: Check Format
+        id: npm-format-check
+        run: npm run format:check
+
+      - name: Lint
+        id: npm-lint
+        run: npm run lint
+
+      - name: Test
+        id: npm-ci-test
+        run: npx vitest run --passWithNoTests --coverage
+
+      - name: Coverage Report
+        id: coverage-report
+        run: |
+          if [ ! -f coverage/coverage-summary.json ]; then
+            echo "::warning::No coverage summary found - skipping report"
+            exit 0
+          fi
+
+          STATEMENTS=$(jq -r '.total.statements.pct' coverage/coverage-summary.json)
+          BRANCHES=$(jq -r '.total.branches.pct' coverage/coverage-summary.json)
+          FUNCTIONS=$(jq -r '.total.functions.pct' coverage/coverage-summary.json)
+          LINES=$(jq -r '.total.lines.pct' coverage/coverage-summary.json)
+
+          {
+            echo "## Coverage Report"
+            echo ""
+            echo "| Metric | Coverage |"
+            echo "| --- | --- |"
+            echo "| Statements | ${STATEMENTS}% |"
+            echo "| Branches | ${BRANCHES}% |"
+            echo "| Functions | ${FUNCTIONS}% |"
+            echo "| Lines | ${LINES}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Statements coverage: ${STATEMENTS}%"
+
+  # Single job that holds the environment gate. The matrix job and the
+  # downstream chain `needs:` this — that way approval is asked for
+  # once per workflow run instead of once per matrix entry.
+  pr-integration-tests-gate:
+    name: PR integration tests gate
+    runs-on: ubuntu-24.04
+    needs: general-tests
+    environment:
+      ${{ github.event_name == 'pull_request_target' && 'pr-integration-tests'
+      || '' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Gate
+        run: echo "Integration tests approved to run."
+
+  integration-tests:
+    name: Test
+    runs-on: ubuntu-24.04
+    needs: pr-integration-tests-gate
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      max-parallel: 1
+      matrix:
+        tests:
+          - title: '1a - Single: Untagged'
+            purpose: 'Removes all untagged images (single arch)'
+            folder: '1a_single-untagged'
+
+          - title: '1b - Multi: Untagged'
+            purpose: 'Removes all untagged images (multi arch)'
+            folder: '1b_multi-untagged'
+            registry-url: 'https://ghcr.io'
+            github-api-url: 'https://api.github.com'
+
+          - title: '2a - Single: Tagged'
+            purpose: 'Removes images with specific tag (single arch)'
+            folder: '2a_single-tagged'
+            delete-tags: '1.35-uclibc,sha256:2707e3b95977dedc54aec62c1991be635d175c83dce0a0b5e8e43e545467003c'
+
+          - title: '2b - Multi: Tagged'
+            purpose: 'Removes images with specific tag (multi arch)'
+            folder: '2b_multi-tagged'
+            delete-tags: '^1.3[56]-uclibc$'
+            use-regex: true
+
+          - title: '3a - Single: Keep N Tagged'
+            purpose:
+              'Removes all tags except the newest 2 tagged images (single arch)
+              and keeps untagged'
+            folder: '3a_single-keep-n-tagged'
+            keep-n-tagged: 2
+            exclude-tags: sha256:1a41828fc1a347d7061f7089d6f0c94e5a056a3c674714712a1481a4a33eb56f
+            use-regex: true
+
+          - title: '3b - Multi: Keep N Tagged'
+            purpose:
+              'Removes all tags except the newest 2 tagged images (multi arch)
+              and keeps untagged'
+            folder: '3b_multi-keep-n-tagged'
+            keep-n-tagged: 2
+            exclude-tags: dummy
+
+          - title: '3c - Multi: Keep N Tagged with tags'
+            purpose: 'Keeps two tag rc images'
+            folder: '3c_multi-keep-n-tagged'
+            delete-tags: '*-rc*'
+            keep-n-tagged: 2
+            exclude-tags: dummy
+
+          - title: '4a - Single: Keep N Untagged'
+            purpose:
+              'Keeps all tagged images and removes all but the newest 2 untagged
+              images (single arch)'
+            folder: '4a_single-keep-n-untagged'
+            keep-n-untagged: 2
+
+          - title: '4b - Multi: Keep N Untagged'
+            purpose:
+              'Keeps all tagged images and removes all but the newest 2 untagged
+              images (multi arch)'
+            folder: '4b_multi-keep-n-untagged'
+            keep-n-untagged: 2
+
+          - title: '5 - Dry-Run'
+            purpose: 'No packages are removed'
+            folder: '5_dry-run'
+            dry-run: true
+
+          - title: '6a - Missing Digests: Tagged'
+            purpose: 'Looks for missing digests'
+            folder: '6a_missing-digests-tagged'
+            delete-tags: '1.34-uclibc'
+
+          - title: '6b - Ghost Images'
+            purpose: 'Deletes Ghost images'
+            folder: '6b_ghost-images'
+            delete-ghost-images: true
+
+          - title: '6c - Partial Images'
+            purpose: 'Deletes Partial images'
+            folder: '6c_partial-images'
+            delete-partial-images: true
+
+          - title: '6d - Orphaned Images'
+            purpose: 'Deletes Orphaned images'
+            folder: '6d_orphaned-images'
+            delete-orphaned-images: true
+
+          - title: '7a - Single: Untagging Images'
+            purpose: 'Untagging multi tagged images (single arch)'
+            folder: '7a_single-untagging'
+            delete-tags: tag1,tag2
+
+          - title: '7b - Single: Untagging All Images'
+            purpose: 'Untagging all multi tagged images (single arch)'
+            folder: '7b_single-untagging-all'
+            delete-tags: '*tag*'
+
+          - title: '7c - Multi: Untagging Images'
+            purpose: 'Untagging multi tagged images (multi arch)'
+            folder: '7c_multi-untagging'
+            delete-tags: tag2,tag3
+
+          - title:
+              '7d - delete-tags + keep-n-tagged + older-than spares multi-tagged
+              images from untag-before-gate'
+            purpose:
+              'keep-n-tagged must gate the untag path: a multi-tagged image
+              whose tag matches delete-tags must not be stripped of that tag if
+              the image is in the keep set. older-than is included to mirror the
+              exact option combination reported in upstream issue #99 (all
+              primed images are well over 1 second old by the time the action
+              runs, so the age filter is innocuous — its presence should not
+              change the keep/untag decision).'
+            folder: '7d_delete-tags-keepn-untag-gate'
+            delete-tags: '^v1\.\d+$'
+            keep-n-tagged: 2
+            older-than: 1 second
+            use-regex: true
+
+          - title:
+              '7e - Multi: delete-tags + keep-n-tagged gates untag for in-set
+              images and lets untag proceed for out-of-set images'
+            purpose:
+              'Multi-arch coverage of the keep-n-tagged + delete-tags
+              interaction. An image in the keep set must not have its matched
+              tag stripped (gating); an image NOT in the keep set must still get
+              its matched tag untagged (positive untag path). Also exercises the
+              per-image keep-set dedup when matched tags span multiple images.'
+            folder: '7e_multi-delete-tags-keepn-gating'
+            delete-tags: '^(beta|legacy|old)$'
+            keep-n-tagged: 1
+            use-regex: true
+
+          - title: '8a - Multi: Complex'
+            purpose: 'Complex combined Test (multi arch)'
+            folder: '8a_multi-complex'
+            keep-n-tagged: 1
+            delete-untagged: true
+            exclude-tags: sha256:1a41828fc1a347d7061f7089d6f0c94e5a056a3c674714712a1481a4a33eb56f
+
+          - title: '8b - Multi: Complex'
+            purpose: 'Complex combined Test (multi arch)'
+            folder: '8b_multi-complex'
+            keep-n-tagged: 1
+            keep-n-untagged: 1
+            exclude-tags: dummy
+            validate: true
+
+          - title: '8c - Multi: Complex'
+            purpose: 'Complex combined Test (multi arch)'
+            folder: '8c_multi-complex'
+            keep-n-tagged: 0
+            keep-n-untagged: 0
+            exclude-tags: dummy
+
+          - title: '9a - Multi: Older Than Skip All Images'
+            purpose: 'Skip processing all images'
+            folder: '9a_multi-older-than-skip'
+            older-than: 30 years
+
+          - title: '9b - Multi: Older Than Normal Processing '
+            purpose: 'Normal processing all images'
+            folder: '9b_multi-older-than-process'
+            older-than: 1 second
+
+    steps:
+      # Setup for test execution
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      # Execution of respective test
+      - name: 'Starting Test: ${{ matrix.tests.title }}'
+        env:
+          TEST_PURPOSE: ${{ matrix.tests.purpose }}
+          TEST_DELETE_TAGS: ${{ matrix.tests.delete-tags }}
+          TEST_DELETE_UNTAGGED: ${{ matrix.tests.delete-untagged }}
+          TEST_DELETE_GHOST_IMAGES: ${{ matrix.tests.delete-ghost-images }}
+          TEST_DELETE_PARTIAL_IMAGES: ${{ matrix.tests.delete-partial-images }}
+          TEST_DELETE_ORPHANED_IMAGES:
+            ${{ matrix.tests.delete-orphaned-images }}
+          TEST_KEEP_N_TAGGED: ${{ matrix.tests.keep-n-tagged }}
+          TEST_KEEP_N_UNTAGGED: ${{ matrix.tests.keep-n-untagged }}
+          TEST_EXCLUDE_TAGS: ${{ matrix.tests.exclude-tags }}
+          TEST_OLDER_THAN: ${{ matrix.tests.older-than }}
+          TEST_DRY_RUN: ${{ matrix.tests.dry-run }}
+          TEST_USE_REGEX: ${{ matrix.tests.use-regex }}
+          TEST_VALIDATE: ${{ matrix.tests.validate }}
+          TEST_REGISTRY_URL: ${{ matrix.tests.registry-url }}
+          TEST_GITHUB_API_URL: ${{ matrix.tests.github-api-url }}
+        run: |
+          echo "Purpose of test: $TEST_PURPOSE"
+
+          DELAY="0"
+          if [ -n "$TEST_KEEP_N_TAGGED" ] || [ -n "$TEST_KEEP_N_UNTAGGED" ]; then
+            DELAY="3000"
+          fi
+
+          { echo "DELETE_TAGS=$TEST_DELETE_TAGS";
+            echo "DELETE_UNTAGGED=$TEST_DELETE_UNTAGGED";
+            echo "DELETE_GHOST_IMAGES=$TEST_DELETE_GHOST_IMAGES";
+            echo "DELETE_PARTIAL_IMAGES=$TEST_DELETE_PARTIAL_IMAGES";
+            echo "DELETE_ORPHANED_IMAGES=$TEST_DELETE_ORPHANED_IMAGES";
+            echo "KEEP_N_TAGGED=$TEST_KEEP_N_TAGGED";
+            echo "KEEP_N_UNTAGGED=$TEST_KEEP_N_UNTAGGED";
+            echo "EXCLUDE_TAGS=$TEST_EXCLUDE_TAGS";
+            echo "OLDER_THAN=$TEST_OLDER_THAN";
+            echo "DRY_RUN=$TEST_DRY_RUN";
+            echo "USE_REGEX=$TEST_USE_REGEX";
+            echo "REGISTRY_URL=$TEST_REGISTRY_URL";
+            echo "GITHUB_API_URL=$TEST_GITHUB_API_URL";
+            echo "VALIDATE=$TEST_VALIDATE";
+            echo "DELAY=$DELAY"; } >> "$GITHUB_ENV"
+
+      - name: ' > Priming Test Environment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEST_FOLDER: ${{ matrix.tests.folder }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" \
+            --directory "tests/$TEST_FOLDER" \
+            --mode prime --delay "$DELAY"
+
+      - name: ' > Running Workflow'
+        uses: ./
+        with:
+          delete-tags: ${{ env.DELETE_TAGS }}
+          delete-untagged: ${{ env.DELETE_UNTAGGED }}
+          delete-ghost-images: ${{ env.DELETE_GHOST_IMAGES }}
+          delete-partial-images: ${{ env.DELETE_PARTIAL_IMAGES }}
+          delete-orphaned-images: ${{ env.DELETE_ORPHANED_IMAGES }}
+          keep-n-tagged: ${{ env.KEEP_N_TAGGED }}
+          keep-n-untagged: ${{ env.KEEP_N_UNTAGGED }}
+          exclude-tags: ${{ env.EXCLUDE_TAGS }}
+          older-than: ${{ env.OLDER_THAN }}
+          dry-run: ${{ env.DRY_RUN }}
+          use-regex: ${{ env.USE_REGEX }}
+          validate: ${{ env.VALIDATE }}
+          registry-url: ${{ env.REGISTRY_URL }}
+          github-api-url: ${{ env.GITHUB_API_URL }}
+          log-level: info
+
+      - name: ' > Validating Outcome'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEST_FOLDER: ${{ matrix.tests.folder }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" \
+            --directory "tests/$TEST_FOLDER" \
+            --mode validate
+
+  github-attestation-tests:
+    name: Github Referrer/Attestation Tests
+    runs-on: ubuntu-24.04
+    env:
+      REGISTRY: ghcr.io
+    needs: integration-tests
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      # Setup for test execution
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      # referrer/attestation tests
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: lower-repo
+        run: |
+          echo "repository=${GITHUB_REPOSITORY@L}" >> "$GITHUB_OUTPUT"
+
+      # attestation tagged test
+      - name: Prime Test - Attestation Tagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/attestation-tagged --mode prime
+      - name: Build and push image
+        id: push1
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: tests/attestation-tagged
+          file: tests/attestation-tagged/Dockerfile.image
+          push: true
+          tags:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository }}:test
+      - name: Attest Image
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository }}
+          subject-digest: ${{ steps.push1.outputs.digest }}
+          push-to-registry: true
+      - name: Run Test - Attestation Tagged
+        uses: ./
+        with:
+          delete-tags: test
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate Test Results - Attestation Tagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/attestation-tagged --mode validate
+
+      # attestation untagged test
+      - name: Prime Test - Attestation UnTagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/attestation-untagged --mode prime
+      - name: Build and push image 1
+        id: push2
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: tests/attestation-untagged
+          file: tests/attestation-untagged/Dockerfile.image1
+          push: true
+          tags:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository }}:test
+      - name: Attest Image 1
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository }}
+          subject-digest: ${{ steps.push2.outputs.digest }}
+          push-to-registry: true
+      - name: Build and push image 2
+        id: push3
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: tests/attestation-untagged
+          file: tests/attestation-untagged/Dockerfile.image2
+          push: true
+          tags:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository }}:test
+      - name: Attest Image 2
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository }}
+          subject-digest: ${{ steps.push3.outputs.digest }}
+          push-to-registry: true
+      - name: Save Digests - Attestation UnTagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/attestation-untagged --mode save-expected --tag test
+      - name: Run Test - Attestation UnTagged
+        uses: ./
+        with:
+          validate: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate Test Results - Attestation Tagged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/attestation-untagged --mode validate
+
+  cosign-test:
+    name: Cosign Test
+    needs: github-attestation-tests
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: lower-repo
+        run: |
+          echo "repository=${GITHUB_REPOSITORY@L}" >> "$GITHUB_OUTPUT"
+
+      - name: Prime Test - Cosign Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/cosign --mode prime
+
+      - name: Build and push image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: tests/cosign
+          file: tests/cosign/Dockerfile.image
+          push: true
+          tags:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository
+            }}:cosign
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign container image
+        env:
+          IMAGE_REF:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository
+            }}:cosign
+          TAGS: cosign
+          COSIGN_EXPERIMENTAL: false
+        run: |
+          cosign sign -y "$IMAGE_REF"
+
+      - name: Run Test - Cosign
+        uses: ./
+        with:
+          delete-tags: cosign
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Test Results - Cosign
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/cosign --mode validate
+
+  multi-package-cleanup:
+    name: Cleanup Multiple Packages
+    runs-on: ubuntu-24.04
+    needs: cosign-test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Run Test - Multi-package Cleanup
+        uses: ./
+        with:
+          validate: true
+          packages: ghcr-cleanup-action,ghcr-cleanup-action-cache
+          keep-n-tagged: 1
+          delete-untagged: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  shared-image-tagged-test:
+    name: Shared Images Tagged Test
+    runs-on: ubuntu-24.04
+    needs: multi-package-cleanup
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prime Test - Shared Images Tagged Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/shared-images-tagged --mode prime
+
+      # Construct two index manifests in ghcr that *deterministically* share
+      # platform manifest children, so the parent-tracking code in
+      # manifest-analyzer.ts:loadDigestUsedByMap is forced through the shared-
+      # child path. Using buildx --cache-from for this was unreliable because
+      # buildx provenance/timestamp metadata can vary between runs, causing
+      # supposedly-identical platform manifests to get distinct digests.
+      #
+      # Approach: pull busybox's existing per-platform manifests from
+      # mirror.gcr.io (deterministic content-addressed digests) and use
+      # `docker buildx imagetools create` to compose two distinct indexes
+      # both pointing at the same children. image1 = [amd64, arm64];
+      # image2 = [amd64, arm64, 386] — different child set guarantees
+      # different index digests without relying on buildx annotation support.
+      - name: Compose shared-platform indexes via busybox
+        run: |
+          set -euo pipefail
+          RAW=$(docker buildx imagetools inspect --raw mirror.gcr.io/library/busybox:1.36)
+          AMD64=$(echo "$RAW" | jq -r '.manifests[] | select(.platform.architecture=="amd64" and ((.platform.variant // "") == "")) | .digest')
+          ARM64=$(echo "$RAW" | jq -r '.manifests[] | select(.platform.architecture=="arm64") | .digest')
+          I386=$(echo "$RAW" | jq -r '.manifests[] | select(.platform.architecture=="386") | .digest')
+          echo "amd64=$AMD64"
+          echo "arm64=$ARM64"
+          echo "386=$I386"
+          # image1: two platforms shared with image2
+          docker buildx imagetools create --tag "$IMAGE:image1" \
+            "mirror.gcr.io/library/busybox@$AMD64" \
+            "mirror.gcr.io/library/busybox@$ARM64"
+          # image2: three platforms — amd64 & arm64 shared with image1, 386 unique
+          docker buildx imagetools create --tag "$IMAGE:image2" \
+            "mirror.gcr.io/library/busybox@$AMD64" \
+            "mirror.gcr.io/library/busybox@$ARM64" \
+            "mirror.gcr.io/library/busybox@$I386"
+
+      # Save image1's index + children as the "must survive" set. image1 is
+      # iterated SECOND by manifest-analyzer (ghcr API returns created_at
+      # DESC), so when we delete image2 below the shared children's recorded
+      # parent set is {image2} — bug deletes them; correct behavior leaves
+      # them for image1.
+      - name: Save Digests - Shared Images Tagged Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/shared-images-tagged --mode save-expected --tag image1
+
+      - name: Run Test - Shared Images Tagged Test
+        uses: ./
+        with:
+          validate: true
+          delete-tags: image2
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Test Results - Shared Images Tagged Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/shared-images-tagged --mode validate
+
+  shared-image-untagged-test:
+    name: Shared Images Untagged Test
+    runs-on: ubuntu-24.04
+    needs: shared-image-tagged-test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Prime Test - Shared Images Untagged Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/shared-images-untagged --mode prime
+
+      - name: Create builder
+        run: docker buildx create --name mybuilder --use --bootstrap
+
+      - name: Build multi-platform dummy
+        run:
+          docker buildx build --cache-to
+          "type=registry,ref=$IMAGE-cache:latest,mode=max" --cache-from
+          "type=registry,ref=$IMAGE-cache:latest" --platform
+          linux/amd64,linux/arm64 --push -t "$IMAGE:dummy"
+          tests/shared-images-untagged
+
+      - name: Build multi-platform dummy
+        run:
+          docker buildx build --cache-to
+          "type=registry,ref=$IMAGE-cache:latest,mode=max" --cache-from
+          "type=registry,ref=$IMAGE-cache:latest" --platform
+          linux/amd64,linux/arm64 --push -t "$IMAGE:dummy"
+          tests/shared-images-untagged
+
+      - name: Reload dummy - Shared Images Untagged Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/shared-images-untagged --mode prime-dummy
+
+      - name: Run Test - Shared Images Untagged Test
+        uses: ./
+        with:
+          validate: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Test Results - Shared Images Untagged Test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/shared-images-untagged --mode validate
+
+  multi-package-cleanup-regex:
+    name: Cleanup Multiple Packages - Regex
+    runs-on: ubuntu-24.04
+    needs: shared-image-untagged-test
+    permissions:
+      contents: read
+      packages: write
+    env:
+      GHCR_PAT: ${{ secrets.GHCR_PAT }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Run Test - Multi-package Cleanup
+        if: ${{ env.GHCR_PAT }}
+        uses: ./
+        with:
+          validate: true
+          packages: ghcr-cleanup-action*
+          keep-n-tagged: 1
+          delete-untagged: true
+          expand-packages: true
+          use-regex: true
+          token: ${{ env.GHCR_PAT }}
+
+  # OCI 1.1 referrers regression coverage (cosign hybrid output). cosign in
+  # --registry-referrers-mode oci-1-1 uploads the signature as a subject-
+  # bearing artifact AND, on registries without /referrers support like
+  # ghcr, a fallback tag-list index named sha256-<digest>. Both shapes must
+  # survive delete-untagged — the fallback via existing sha256-* handling,
+  # the subject-bearing referrer via the subjectReferrers cascade.
+  cosign-oci11-test:
+    name: Cosign OCI 1.1 Referrers Test
+    runs-on: ubuntu-24.04
+    needs: multi-package-cleanup-regex
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: lower-repo
+        run: |
+          echo "repository=${GITHUB_REPOSITORY@L}" >> "$GITHUB_OUTPUT"
+
+      - name: Prime - Cosign OCI 1.1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/cosign-oci11 --mode prime
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: tests/cosign-oci11
+          file: tests/cosign-oci11/Dockerfile.image
+          push: true
+          tags:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository
+            }}:cosign-oci11
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Cosign version (diagnostic)
+        run: cosign version
+
+      - name: Sign container image (OCI 1.1 referrers mode)
+        env:
+          IMAGE_REF:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository
+            }}:cosign-oci11
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign -y --registry-referrers-mode oci-1-1 "$IMAGE_REF"
+
+      - name: Dump registry state after signing (diagnostic)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository
+            }}:cosign-oci11
+        run: |
+          set -euo pipefail
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          echo '===== GitHub Packages — versions list ====='
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions" \
+            | jq '.[] | {id, digest: .name, tags: .metadata.container.tags, created_at, updated_at}'
+          echo
+          echo '===== Registry — manifest of the signed tag (for digest) ====='
+          # Acquire a pull-scoped token, then inspect manifests.
+          PULL_TOKEN=$(curl -fsSL \
+            -u "token:$GH_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_OWNER,,}/ghcr-cleanup-action:pull" \
+            | jq -r '.token')
+          SIGNED_DIGEST=$(curl -fsSL \
+            -H "Authorization: Bearer $PULL_TOKEN" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            -D - -o /dev/null \
+            "https://ghcr.io/v2/${REPO_OWNER,,}/ghcr-cleanup-action/manifests/cosign-oci11" \
+            | tr -d '\r' | awk '/^[Dd]ocker-[Cc]ontent-[Dd]igest:/ {print $2}')
+          echo "Signed image digest: $SIGNED_DIGEST"
+          echo
+          echo '===== Inspecting EVERY package version manifest (including tagged) ====='
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions" \
+            | jq -r '.[] | "\(.name)|\(.metadata.container.tags | join(","))"' \
+            | while IFS='|' read -r digest tags; do
+                echo "--- $digest  tags=[$tags] ---"
+                curl -fsSL \
+                  -H "Authorization: Bearer $PULL_TOKEN" \
+                  -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                  "https://ghcr.io/v2/${REPO_OWNER,,}/ghcr-cleanup-action/manifests/$digest" \
+                  | jq '{mediaType, artifactType, subject, config: .config.mediaType, layerCount: (.layers // [] | length), manifestChildren: (.manifests // [] | map({digest, artifactType, mediaType}))}'
+              done
+
+      - name: Capture runtime artifacts for Cosign OCI 1.1 fixture
+        id: capture
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_LC: ${{ steps.lower-repo.outputs.repository }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -uo pipefail
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          FALLBACK_TAG="sha256-${IMAGE_DIGEST#sha256:}"
+
+          # Enumerate package versions via the GitHub Packages API — this is
+          # the same endpoint the diagnostic step above uses and matches the
+          # source of truth the citester reads from.
+          VERSIONS_BODY=$(mktemp)
+          VERSIONS_HTTP=$(curl -sSL -o "$VERSIONS_BODY" -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions")
+          echo "Versions API HTTP $VERSIONS_HTTP"
+          if [ "$VERSIONS_HTTP" != "200" ]; then
+            echo "Versions API failed:"
+            cat "$VERSIONS_BODY"
+            exit 1
+          fi
+
+          echo "===== All package versions ====="
+          jq '.[] | {digest: .name, tags: .metadata.container.tags}' "$VERSIONS_BODY"
+
+          # Fallback tag-list index: the version tagged sha256-<image-digest>.
+          FALLBACK_LIST_DIGEST=$(jq -r --arg t "$FALLBACK_TAG" '
+            .[] | select((.metadata.container.tags // []) | index($t)) | .name
+          ' "$VERSIONS_BODY" | head -n1)
+
+          # Subject-referrer: walk untagged versions and pick the one whose
+          # subject.digest points back at our image. This is the artifact my
+          # code fix protects from delete-untagged. Walking via the registry
+          # API (not /referrers, which ghcr does not implement) mirrors what
+          # the action itself does at runtime.
+          PULL_TOKEN=$(curl -sSL -u "token:$GH_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_LC}:pull" \
+            | jq -r '.token')
+
+          SUBJECT_REFERRER_DIGEST=""
+          for digest in $(jq -r '.[] | select((.metadata.container.tags // []) | length == 0) | .name' "$VERSIONS_BODY"); do
+            MANIFEST_BODY=$(mktemp)
+            MANIFEST_HTTP=$(curl -sSL -o "$MANIFEST_BODY" -w '%{http_code}' \
+              -H "Authorization: Bearer $PULL_TOKEN" \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+              "https://ghcr.io/v2/${REPO_LC}/manifests/$digest")
+            if [ "$MANIFEST_HTTP" != "200" ]; then
+              echo "  manifest $digest fetch failed: HTTP $MANIFEST_HTTP"
+              continue
+            fi
+            SUBJECT=$(jq -r '.subject.digest // empty' "$MANIFEST_BODY")
+            echo "  untagged $digest subject=${SUBJECT:-<none>}"
+            if [ "$SUBJECT" = "$IMAGE_DIGEST" ]; then
+              SUBJECT_REFERRER_DIGEST="$digest"
+            fi
+          done
+
+          echo "Captured:"
+          echo "  image_digest:            $IMAGE_DIGEST"
+          echo "  fallback_tag:            $FALLBACK_TAG"
+          echo "  fallback_list_digest:    $FALLBACK_LIST_DIGEST"
+          echo "  subject_referrer_digest: $SUBJECT_REFERRER_DIGEST"
+
+          if [ -z "$IMAGE_DIGEST" ] || [ -z "$FALLBACK_LIST_DIGEST" ] || [ -z "$SUBJECT_REFERRER_DIGEST" ]; then
+            echo "FAIL: one of the runtime artifact digests is empty — see the dump above."
+            exit 1
+          fi
+
+          {
+            echo "image_digest=${IMAGE_DIGEST}"
+            echo "fallback_tag=${FALLBACK_TAG}"
+            echo "fallback_list_digest=${FALLBACK_LIST_DIGEST}"
+            echo "subject_referrer_digest=${SUBJECT_REFERRER_DIGEST}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Append runtime artifacts to expected fixture
+        env:
+          FALLBACK_TAG: ${{ steps.capture.outputs.fallback_tag }}
+          IMAGE_DIGEST: ${{ steps.capture.outputs.image_digest }}
+          FALLBACK_LIST_DIGEST:
+            ${{ steps.capture.outputs.fallback_list_digest }}
+          SUBJECT_REFERRER_DIGEST:
+            ${{ steps.capture.outputs.subject_referrer_digest }}
+        run: |
+          set -euo pipefail
+          echo "${FALLBACK_TAG}" >> tests/cosign-oci11/expected-tags
+          {
+            echo "${IMAGE_DIGEST} // cosign-oci11 signed image (must survive)"
+            echo "${FALLBACK_LIST_DIGEST} // cosign fallback tag-list index (must survive)"
+            echo "${SUBJECT_REFERRER_DIGEST} // sigstore bundle, OCI 1.1 subject-referrer (must survive with the fix)"
+          } >> tests/cosign-oci11/expected-digests
+          echo '--- expected-tags after append ---'
+          cat tests/cosign-oci11/expected-tags
+          echo '--- expected-digests after append ---'
+          cat tests/cosign-oci11/expected-digests
+
+      - name: Run Test - Cosign OCI 1.1 (delete-untagged - diagnostic)
+        uses: ./
+        with:
+          delete-untagged: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dump registry state after cleanup (diagnostic)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          echo '===== GitHub Packages — versions list after cleanup ====='
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions" \
+            | jq '.[] | {id, digest: .name, tags: .metadata.container.tags}'
+
+      - name: Validate Test Results - Cosign OCI 1.1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/cosign-oci11 --mode validate
+
+  # OCI 1.1 bare-referrer regression coverage (upstream issue shape). Some
+  # publishers push a subject-bearing manifest with no fallback tag, which
+  # the action could not reach via /referrers (ghcr does not implement it)
+  # and so previously deleted as untagged garbage. This job constructs that
+  # exact shape via direct registry PUT — empty config blob, single layer,
+  # sigstore-bundle artifactType, subject pointing at the just-pushed image
+  # — and verifies cleanup preserves it.
+  bare-oci11-referrer-test:
+    name: Bare OCI 1.1 Referrer Test (manual push)
+    runs-on: ubuntu-24.04
+    needs: cosign-oci11-test
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Under pull_request_target the default ref is the base branch —
+          # override so PR jobs actually test PR code. The `|| github.sha`
+          # fallback covers push events (where pull_request is null).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version-file: .node-version
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: lower-repo
+        run: |
+          echo "repository=${GITHUB_REPOSITORY@L}" >> "$GITHUB_OUTPUT"
+
+      - name: Prime - Bare OCI 1.1 Referrer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/bare-oci11-referrer --mode prime
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: tests/bare-oci11-referrer
+          file: tests/bare-oci11-referrer/Dockerfile.image
+          push: true
+          tags:
+            ${{ env.REGISTRY }}/${{ steps.lower-repo.outputs.repository
+            }}:bare-test
+
+      - name: Push a bare OCI 1.1 referrer manifest directly via registry API
+        id: push-referrer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          REPO_LC: ${{ steps.lower-repo.outputs.repository }}
+        run: |
+          set -euo pipefail
+
+          # Acquire a pull+push token scoped to this repo on ghcr.
+          REG_TOKEN=$(curl -fsSL -u "token:$GH_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_LC}:pull,push" \
+            | jq -r '.token')
+
+          # Get the just-pushed image manifest's size (needed for the subject
+          # descriptor).
+          IMAGE_SIZE=$(curl -fsSL -I \
+            -H "Authorization: Bearer $REG_TOKEN" \
+            -H "Accept: application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json" \
+            "https://ghcr.io/v2/${REPO_LC}/manifests/${IMAGE_DIGEST}" \
+            | tr -d '\r' | awk '/^[Cc]ontent-[Ll]ength:/ {print $2}')
+          echo "Image digest: ${IMAGE_DIGEST}"
+          echo "Image manifest size: ${IMAGE_SIZE}"
+
+          # Upload the well-known empty config blob (OCI spec defines
+          # vnd.oci.empty.v1+json with content '{}' and a fixed digest).
+          EMPTY_DIGEST="sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+          echo -n '{}' > /tmp/empty.json
+          actual_digest="sha256:$(sha256sum /tmp/empty.json | awk '{print $1}')"
+          test "$actual_digest" = "$EMPTY_DIGEST"
+
+          # Check if the blob already exists on the registry; if not, push it.
+          if ! curl -fsSL -I -H "Authorization: Bearer $REG_TOKEN" \
+              "https://ghcr.io/v2/${REPO_LC}/blobs/${EMPTY_DIGEST}" > /dev/null 2>&1; then
+            UPLOAD_LOC=$(curl -fsSL -X POST -D - -o /dev/null \
+              -H "Authorization: Bearer $REG_TOKEN" \
+              "https://ghcr.io/v2/${REPO_LC}/blobs/uploads/" \
+              | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}')
+            curl -fsSL -X PUT \
+              -H "Authorization: Bearer $REG_TOKEN" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @/tmp/empty.json \
+              "${UPLOAD_LOC}&digest=${EMPTY_DIGEST}"
+            echo "Pushed empty config blob: ${EMPTY_DIGEST}"
+          else
+            echo "Empty config blob already present: ${EMPTY_DIGEST}"
+          fi
+
+          # Construct the bare OCI 1.1 referrer manifest: artifactType set
+          # to a sigstore bundle media type to mimic issue #104's reporter, with
+          # subject pointing at our just-pushed image. Empty config + empty
+          # single layer (registry needs the layer descriptor to be
+          # resolvable; we reuse the same empty blob).
+          cat > /tmp/sig.json <<EOF
+          {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            "config": {
+              "mediaType": "application/vnd.oci.empty.v1+json",
+              "digest": "${EMPTY_DIGEST}",
+              "size": 2
+            },
+            "layers": [
+              {
+                "mediaType": "application/vnd.oci.empty.v1+json",
+                "digest": "${EMPTY_DIGEST}",
+                "size": 2
+              }
+            ],
+            "subject": {
+              "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+              "digest": "${IMAGE_DIGEST}",
+              "size": ${IMAGE_SIZE}
+            }
+          }
+          EOF
+
+          # Compute the manifest's content digest, push it by digest (no tag).
+          SIG_DIGEST="sha256:$(sha256sum /tmp/sig.json | awk '{print $1}')"
+          curl -fsSL -X PUT \
+            -H "Authorization: Bearer $REG_TOKEN" \
+            -H "Content-Type: application/vnd.oci.image.manifest.v1+json" \
+            --data-binary @/tmp/sig.json \
+            "https://ghcr.io/v2/${REPO_LC}/manifests/${SIG_DIGEST}"
+          echo "Pushed bare OCI 1.1 referrer: ${SIG_DIGEST}"
+          echo "  artifactType: application/vnd.dev.sigstore.bundle.v0.3+json"
+          echo "  subject.digest: ${IMAGE_DIGEST}"
+
+          # Export both runtime digests for the next step to fold into the
+          # expected-digests fixture (the validate step will then assert
+          # both must survive cleanup).
+          echo "sig_digest=${SIG_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Append runtime digests to expected-digests
+        env:
+          IMAGE_DIGEST: ${{ steps.push.outputs.digest }}
+          SIG_DIGEST: ${{ steps.push-referrer.outputs.sig_digest }}
+        run: |
+          set -euo pipefail
+          {
+            echo "${IMAGE_DIGEST} // bare-test image (must survive)"
+            echo "${SIG_DIGEST} // bare OCI 1.1 referrer (must survive cleanup with the subject-referrer fix)"
+          } >> tests/bare-oci11-referrer/expected-digests
+          echo '--- expected-digests after append ---'
+          cat tests/bare-oci11-referrer/expected-digests
+
+      - name: Dump registry state after bare referrer push (diagnostic)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          echo '===== GitHub Packages — versions list ====='
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions" \
+            | jq '.[] | {id, digest: .name, tags: .metadata.container.tags, created_at, updated_at}'
+          echo
+          echo '===== Inspecting EVERY package version manifest ====='
+          PULL_TOKEN=$(curl -fsSL \
+            -u "token:$GH_TOKEN" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:${REPO_OWNER,,}/ghcr-cleanup-action:pull" \
+            | jq -r '.token')
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions" \
+            | jq -r '.[] | "\(.name)|\(.metadata.container.tags | join(","))"' \
+            | while IFS='|' read -r digest tags; do
+                echo "--- $digest  tags=[$tags] ---"
+                curl -fsSL \
+                  -H "Authorization: Bearer $PULL_TOKEN" \
+                  -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+                  "https://ghcr.io/v2/${REPO_OWNER,,}/ghcr-cleanup-action/manifests/$digest" \
+                  | jq '{mediaType, artifactType, subject, config: .config.mediaType, layerCount: (.layers // [] | length), manifestChildren: (.manifests // [] | map({digest, artifactType, mediaType}))}'
+              done
+
+      - name:
+          Run Test - Bare OCI 1.1 referrer (delete-untagged - expected to delete
+          the bare referrer under current behavior)
+        uses: ./
+        with:
+          delete-untagged: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dump registry state after cleanup (diagnostic)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REPO_OWNER="${GITHUB_REPOSITORY%/*}"
+          echo '===== GitHub Packages — versions list after cleanup ====='
+          curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/users/$REPO_OWNER/packages/container/ghcr-cleanup-action/versions" \
+            | jq '.[] | {id, digest: .name, tags: .metadata.container.tags}'
+
+      - name: Validate Test Results - Bare OCI 1.1 Referrer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node citester/index.js --token "$GH_TOKEN" --directory \
+            tests/bare-oci11-referrer --mode validate
