@@ -1,0 +1,52 @@
+name: Lint Codebase
+
+on: [pull_request, push]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint Codebase
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+      statuses: write
+
+    steps:
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        id: setup-node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version-file: .node-version
+          cache: npm
+
+      - name: Install Dependencies
+        id: install
+        run: npm ci
+
+      - name: Lint Codebase
+        id: super-linter
+        uses: step-security/super-linter/slim@7e1f2e8eb227a9549241219a10d3a48fcc2947f7 # v8
+        env:
+          DEFAULT_BRANCH: main
+          FILTER_REGEX_EXCLUDE: (dist|citester)/.*|README\.md|SECURITY\.md|\.github/workflows/(actions_release|audit_package|auto_cherry_pick|claude_review)\.yml
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VALIDATE_ALL_CODEBASE: true
+          VALIDATE_JAVASCRIPT_STANDARD: false
+          VALIDATE_TYPESCRIPT_STANDARD: false
+          VALIDATE_JSCPD: false
+          VALIDATE_BIOME_FORMAT: false
+          VALIDATE_BIOME_LINT: false
+          VALIDATE_JAVASCRIPT_ES: false
+          VALIDATE_TYPESCRIPT_ES: false
+          VALIDATE_JAVASCRIPT_PRETTIER: false
+          VALIDATE_TYPESCRIPT_PRETTIER: false
