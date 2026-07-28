@@ -1,0 +1,3 @@
+[[IgnoredVulns]]
+id = "GHSA-mh99-v99m-4gvg"
+reason = "brace-expansion DoS — fix requires v5.0.8 which is a breaking major bump; no exploitable path in this action"
