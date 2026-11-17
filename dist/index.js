@@ -8224,20 +8224,6 @@ var escClose = '\0CLOSE'+Math.random()+'\0';
 var escComma = '\0COMMA'+Math.random()+'\0';
 var escPeriod = '\0PERIOD'+Math.random()+'\0';
 
-var EXPANSION_MAX = 100000
-
-// `EXPANSION_MAX` caps the *number* of expansions, but not their length. An
-// input like `'{a,b}'.repeat(1500)` stays under that count - its output is
-// truncated to 100k results - while making every result ~1500 characters
-// long. The result set, and the intermediate arrays built while combining
-// brace sets, then grow large enough to exhaust memory and crash the process
-// (CVE-2026-14257). `EXPANSION_MAX_LENGTH` bounds the total number of
-// characters the accumulator may hold at any point, so memory stays flat no
-// matter how many brace groups are chained. The limit sits well above any
-// realistic expansion (100k results hitting `EXPANSION_MAX` measure ~1M
-// characters) so legitimate input is unaffected.
-var EXPANSION_MAX_LENGTH = 4000000
-
 function numeric(str) {
   return parseInt(str, 10) == str
     ? parseInt(str, 10)
@@ -8296,8 +8282,7 @@ function expandTop(str, options) {
     return [];
 
   options = options || {};
-  var max = options.max == null ? EXPANSION_MAX : options.max;
-  var maxLength = options.maxLength == null ? EXPANSION_MAX_LENGTH : options.maxLength;
+  var max = options.max == null ? Infinity : options.max;
 
   // I don't know why Bash 4.3 does this, but it does.
   // Anything starting with {} will have the first two bytes preserved
@@ -8309,7 +8294,7 @@ function expandTop(str, options) {
     str = '\\{\\}' + str.substr(2);
   }
 
-  return expand(escapeBraces(str), max, maxLength, true).map(unescapeBraces);
+  return expand(escapeBraces(str), max, true).map(unescapeBraces);
 }
 
 function identity(e) {
@@ -8330,155 +8315,15 @@ function gte(i, y) {
   return i >= y;
 }
 
-// Build `{ acc[a] + pre + values[v] }` for every combination, capping the
-// number of results at `max` and the total number of characters at `maxLength`.
-// This is the one place output grows, so bounding it here keeps the single
-// accumulator - and therefore memory - flat regardless of how many brace groups
-// are combined (CVE-2026-14257).
-//
-// `base[a]` is the length of the part of `acc[a]` that predates the current
-// empty-drop baseline (see `expand`). The matching baselines for the results
-// are appended to `outBase`, which the caller carries forward alongside them.
-function combine(
-  acc,
-  base,
-  pre,
-  values,
-  max,
-  maxLength,
-  dropEmpties,
-  outBase
-) {
-  var out = []
-  var length = 0
-  for (var a = 0; a < acc.length; a++) {
-    for (var v = 0; v < values.length; v++) {
-      if (out.length >= max) return out
-      var expansion = acc[a] + pre + values[v]
-      // Bash drops empty results at the top level. Skip them before they count
-      // against `max`, so `max` bounds the number of *kept* results. "Empty"
-      // means "adds nothing past the baseline", not "empty overall".
-      if (dropEmpties && expansion.length === base[a]) continue
-      if (length + expansion.length > maxLength) return out
-      out.push(expansion)
-      outBase.push(base[a])
-      length += expansion.length
-    }
-  }
-  return out
-}
+function expand(str, max, isTop) {
+  var expansions = [];
 
-// The expansion values of a single numeric (`1..5`) or alphabetic (`a..e..2`)
-// sequence body.
-function expandSequence(
-  body,
-  isAlphaSequence,
-  max,
-  maxLength
-) {
-  var n = body.split(/\.\./)
-  var N = []
-  // A sequence body always splits into two or three parts, but the compiler
-  // can't know that.
-  /* c8 ignore start */
-  if (n[0] === undefined || n[1] === undefined) {
-    return N
-  }
-  /* c8 ignore stop */
-  var x = numeric(n[0])
-  var y = numeric(n[1])
-  var width = Math.max(n[0].length, n[1].length)
-  var incr =
-    n.length === 3 && n[2] !== undefined ?
-      Math.max(Math.abs(numeric(n[2])), 1)
-    : 1
-  var test = lte
-  var reverse = y < x
-  if (reverse) {
-    incr *= -1
-    test = gte
-  }
-  var pad = n.some(isPadded)
-
-  var length = 0
-  for (var i = x; test(i, y) && N.length < max; i += incr) {
-    var c
-    if (isAlphaSequence) {
-      c = String.fromCharCode(i)
-      if (c === '\\') {
-        c = ''
-      }
-    } else {
-      c = String(i)
-      if (pad) {
-        var need = width - c.length
-        if (need > 0) {
-          var z = new Array(need + 1).join('0')
-          if (i < 0) {
-            c = '-' + z + c.slice(1)
-          } else {
-            c = z + c
-          }
-        }
-      }
-    }
-    if (length + c.length > maxLength) break
-    N.push(c)
-    length += c.length
-  }
-  return N
-}
-
-function expand(
-  str,
-  max,
-  maxLength,
-  isTop
-) {
-  // Consume the string's top-level brace groups left to right, threading a
-  // running set of combined prefixes (`acc`). Expanding the tail iteratively -
-  // rather than recursing on `m.post` once per group - keeps the native stack
-  // depth constant, so deeply chained input (`'{a,b}'.repeat(3000)`) can no
-  // longer overflow the stack, and leaves a single accumulator whose size
-  // `maxLength` bounds directly (CVE-2026-14257).
-  var acc = ['']
-
-  // Bash drops empty results, but only when the *first* group of the run is a
-  // comma set - a sequence like `{a..\}` may legitimately yield ''. The drop
-  // is on the final strings, so it is applied to whichever `combine` produces
-  // them (the one with no brace set left in the tail).
-  //
-  // The old implementation recursed on `m.post`, so the drop tested only the
-  // expansion of the current call's substring. The `{a},b}` rewrite below turns
-  // `isTop` back on part-way through a string, starting a fresh such run, so
-  // the drop must ignore whatever `acc` already holds from earlier groups.
-  // `accBase[a]` records how much of `acc[a]` predates the current run;
-  // `combine` treats an expansion as empty when it adds nothing past that.
-  var accBase = [0]
-  var dropEmpties = false
-  var firstGroup = true
-  var nextBase
-
+  // The `{a},b}` rewrite below restarts expansion on a rewritten string with
+  // the same `max` and `isTop = true`. Loop instead of recursing so a long run
+  // of non-expanding `{}` groups can't exhaust the call stack.
   for (;;) {
     var m = balanced('{', '}', str);
-
-    // No brace set left: the rest of the string is literal.
-    if (!m) {
-      return combine(acc, accBase, str, [''], max, maxLength, dropEmpties, [])
-    }
-
-    // no need to expand pre, since it is guaranteed to be free of brace-sets
-    var pre = m.pre;
-
-    // For compatibility reasons, `${` is not eligible for brace expansion, and
-    // on the 1.x line it suppresses expansion of the rest of the string too:
-    // the whole remainder is literal. The 2.x and 5.x lines instead keep
-    // expanding the tail, which is what bash does, but changing that here would
-    // be a breaking change for 1.x consumers. Routed through `combine` so the
-    // result is still bounded by `max` and `maxLength`.
-    if (/\$$/.test(pre)) {
-      return combine(acc, accBase, str, [''], max, maxLength, dropEmpties, [])
-    }
+    if (!m || /\$$/.test(m.pre)) return [str];
 
     var isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
     var isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
@@ -8488,112 +8333,94 @@ function expand(
       // {a},b}
       if (m.post.match(/,(?!,).*\}/)) {
         str = m.pre + '{' + m.body + escClose + m.post;
-        // The rewritten string is expanded as if it were a fresh top-level one,
-        // so start a new empty-drop run: anchor the baseline at what `acc`
-        // holds now, and let the next expanding group decide whether to drop.
         isTop = true
-        firstGroup = true
-        dropEmpties = false
-        accBase = []
-        for (var b = 0; b < acc.length; b++) {
-          accBase.push(acc[b].length)
-        }
         continue
       }
-      // Nothing here expands, so the whole remaining string is literal.
-      return combine(
-        acc,
-        accBase,
-        pre + '{' + m.body + '}' + m.post,
-        [''],
-        max,
-        maxLength,
-        dropEmpties,
-        []
-      )
+      return [str];
     }
 
-    if (firstGroup) {
-      dropEmpties = isTop && !isSequence
-      firstGroup = false
-    }
-
-    var values;
+    var n;
     if (isSequence) {
-      values = expandSequence(m.body, isAlphaSequence, max, maxLength);
+      n = m.body.split(/\.\./);
     } else {
-      var n = parseCommaParts(m.body);
-      if (n.length === 1 && n[0] !== undefined) {
+      n = parseCommaParts(m.body);
+      if (n.length === 1) {
         // x{{a,b}}y ==> x{a}y x{b}y
-        n = expand(n[0], max, maxLength, false).map(embrace);
-        //XXX is this necessary? Can't seem to hit it in tests.
-        /* c8 ignore start */
+        n = expand(n[0], max, false).map(embrace);
         if (n.length === 1) {
-          nextBase = []
-          acc = combine(
-            acc,
-            accBase,
-            pre + n[0],
-            [''],
-            max,
-            maxLength,
-            dropEmpties && !m.post.length,
-            nextBase
-          )
-          accBase = nextBase
-          if (!m.post.length) break
-          str = m.post
-          continue
-        }
-        /* c8 ignore stop */
-      }
-
-      // Values that `combine` is going to drop as empty produce no result, so
-      // they must not count against `max` - otherwise `{a,,b}` with `max: 2`
-      // would stop at `['a', '']` and yield one result instead of two. Skipping
-      // them outright keeps `values` bounded while leaving `max` a bound on
-      // *kept* results. A value is dropped when it adds nothing past the
-      // baseline, which is what `combine` tests.
-      var dropsEmpties = dropEmpties && !m.post.length && !pre
-      for (var d = 0; dropsEmpties && d < acc.length; d++) {
-        if (acc[d].length !== accBase[d]) {
-          dropsEmpties = false
-        }
-      }
-
-      values = []
-      var valuesLength = 0
-      outer: for (var j = 0; j < n.length; j++) {
-        var expanded = expand(n[j], max, maxLength, false)
-        for (var k = 0; k < expanded.length; k++) {
-          var v = expanded[k]
-          if (dropsEmpties && !v) continue
-          if (values.length >= max || valuesLength + v.length > maxLength) {
-            break outer
-          }
-          values.push(v)
-          valuesLength += v.length
+          var post = m.post.length
+            ? expand(m.post, max, false)
+            : [''];
+          return post.map(function(p) {
+            return m.pre + n[0] + p;
+          });
         }
       }
     }
 
-    nextBase = []
-    acc = combine(
-      acc,
-      accBase,
-      pre,
-      values,
-      max,
-      maxLength,
-      dropEmpties && !m.post.length,
-      nextBase
-    )
-    accBase = nextBase
-    if (!m.post.length) break
-    str = m.post
-  }
+    // at this point, n is the parts, and we know it's not a comma set
+    // with a single entry.
 
-  return acc
+    // no need to expand pre, since it is guaranteed to be free of brace-sets
+    var pre = m.pre;
+    var post = m.post.length
+      ? expand(m.post, max, false)
+      : [''];
+
+    var N;
+
+    if (isSequence) {
+      var x = numeric(n[0]);
+      var y = numeric(n[1]);
+      var width = Math.max(n[0].length, n[1].length)
+      var incr = n.length == 3
+        ? Math.max(Math.abs(numeric(n[2])), 1)
+        : 1;
+      var test = lte;
+      var reverse = y < x;
+      if (reverse) {
+        incr *= -1;
+        test = gte;
+      }
+      var pad = n.some(isPadded);
+
+      N = [];
+
+      for (var i = x; test(i, y) && N.length < max; i += incr) {
+        var c;
+        if (isAlphaSequence) {
+          c = String.fromCharCode(i);
+          if (c === '\\')
+            c = '';
+        } else {
+          c = String(i);
+          if (pad) {
+            var need = width - c.length;
+            if (need > 0) {
+              var z = new Array(need + 1).join('0');
+              if (i < 0)
+                c = '-' + z + c.slice(1);
+              else
+                c = z + c;
+            }
+          }
+        }
+        N.push(c);
+      }
+    } else {
+      N = concatMap(n, function(el) { return expand(el, max, false) });
+    }
+
+    for (var j = 0; j < N.length; j++) {
+      for (var k = 0; k < post.length && expansions.length < max; k++) {
+        var expansion = pre + N[j] + post[k];
+        if (!isTop || isSequence || expansion)
+          expansions.push(expansion);
+      }
+    }
+
+    return expansions;
+  }
 }
 
 
@@ -12256,16 +12083,7 @@ RedirectableRequest.prototype._sanitizeOptions = function (options) {
   if (!options.headers) {
     options.headers = {};
   }
-  // Convert [header1, value1, header2, value2, …] to object
-  else if (Array.isArray(options.headers)) {
-    var headerList = options.headers;
-    options.headers = {};
-    for (var i = 0; i < headerList.length; i += 2) {
-      options.headers[headerList[i]] = headerList[i + 1];
-    }
-  }
-  // Ensure sensitive headers are always present
-  if (!Array.isArray(options.sensitiveHeaders)) {
+  if (!isArray(options.sensitiveHeaders)) {
     options.sensitiveHeaders = [];
   }
 
@@ -12643,6 +12461,10 @@ function isSubdomain(subdomain, domain) {
   return dot > 0 && subdomain[dot] === "." && subdomain.endsWith(domain);
 }
 
+function isArray(value) {
+  return value instanceof Array;
+}
+
 function isString(value) {
   return typeof value === "string" || value instanceof String;
 }
@@ -12660,8 +12482,7 @@ function isURL(value) {
 }
 
 function escapeRegex(regex) {
-  // As per https://tc39.es/proposal-regexp-modifiers/#prod-SyntaxCharacter
-  return regex.replace(/[\^$\\.*+?()[\]{}|]/g, "\\$&");
+  return regex.replace(/[\]\\/()*+?.$]/g, "\\$&");
 }
 
 // Exports
@@ -23176,77 +22997,11 @@ class Request {
     }
   }
 
-  /**
-   * @param {number|null} statusCode
-   * @param {Buffer[]|null} headers
-   * @param {import('node:stream').Duplex} socket
-   * @param {string} [statusText]
-   */
-  onUpgrade (statusCode, headers, socket, statusText = '') {
-    this.onFinally()
-
+  onUpgrade (statusCode, headers, socket) {
     assert(!this.aborted)
     assert(!this.completed)
 
-    if (statusCode !== null) {
-      this.#publishUpgradeHeaders(statusCode, headers, statusText)
-    }
-
-    const result = this[kHandler].onUpgrade(statusCode, headers, socket)
-
-    if (!this.aborted) {
-      this.completed = true
-      if (statusCode !== null) {
-        this.#publishUpgradeTrailers()
-      }
-    }
-
-    return result
-  }
-
-  /**
-   * @param {number} statusCode
-   * @param {import('node:http2').IncomingHttpHeaders} headers
-   * @param {(headers: import('node:http2').IncomingHttpHeaders) => Buffer[]} parseHeaders
-   * @param {string} [statusText]
-   */
-  onUpgradeResponse (statusCode, headers, parseHeaders, statusText = '') {
-    assert(!this.aborted)
-    assert(this.completed)
-
-    if (channels.headers.hasSubscribers) {
-      this.#publishUpgradeHeaders(statusCode, parseHeaders(headers), statusText)
-    }
-    this.#publishUpgradeTrailers()
-  }
-
-  /**
-   * @param {Error} error
-   */
-  onUpgradeError (error) {
-    assert(!this.aborted)
-    assert(this.completed)
-
-    if (channels.error.hasSubscribers) {
-      channels.error.publish({ request: this, error })
-    }
-  }
-
-  /**
-   * @param {number} statusCode
-   * @param {Buffer[]} headers
-   * @param {string} statusText
-   */
-  #publishUpgradeHeaders (statusCode, headers, statusText) {
-    if (channels.headers.hasSubscribers) {
-      channels.headers.publish({ request: this, response: { statusCode, headers, statusText } })
-    }
-  }
-
-  #publishUpgradeTrailers () {
-    if (channels.trailers.hasSubscribers) {
-      channels.trailers.publish({ request: this, trailers: [] })
-    }
+    return this[kHandler].onUpgrade(statusCode, headers, socket)
   }
 
   onComplete (trailers) {
@@ -24384,7 +24139,7 @@ function defaultFactory (origin, opts) {
 }
 
 class Agent extends DispatcherBase {
-  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, tls, ...options } = {}) {
+  constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
     if (typeof factory !== 'function') {
       throw new InvalidArgumentError('factory must be a function.')
     }
@@ -24403,15 +24158,11 @@ class Agent extends DispatcherBase {
       connect = { ...connect }
     }
 
-    if (tls && typeof tls !== 'function') {
-      tls = { ...tls }
-    }
-
     this[kInterceptors] = options.interceptors?.Agent && Array.isArray(options.interceptors.Agent)
       ? options.interceptors.Agent
       : [createRedirectInterceptor({ maxRedirections })]
 
-    this[kOptions] = { ...util.deepClone(options), connect, tls }
+    this[kOptions] = { ...util.deepClone(options), connect }
     this[kOptions].interceptors = options.interceptors
       ? { ...options.interceptors }
       : undefined
@@ -25149,7 +24900,7 @@ class Parser {
   }
 
   onUpgrade (head) {
-    const { upgrade, client, socket, headers, statusCode, statusText } = this
+    const { upgrade, client, socket, headers, statusCode } = this
 
     assert(upgrade)
     assert(client[kSocket] === socket)
@@ -25184,10 +24935,9 @@ class Parser {
     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
 
     try {
-      request.onUpgrade(statusCode, headers, socket, statusText)
-    } catch (error) {
-      util.errorRequest(client, request, error)
-      util.destroy(socket, error)
+      request.onUpgrade(statusCode, headers, socket)
+    } catch (err) {
+      util.destroy(socket, err)
     }
 
     client[kResume]()
@@ -25444,6 +25194,8 @@ async function connectH1 (client, socket) {
   socket[kParser] = new Parser(client, socket, llhttpInstance)
 
   addListener(socket, 'error', function (err) {
+    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
+
     const parser = this[kParser]
 
     // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
@@ -25592,7 +25344,7 @@ async function connectH1 (client, socket) {
 
 function clearIdleSocketValidation (socket) {
   if (socket[kIdleSocketValidationTimeout]) {
-    clearImmediate(socket[kIdleSocketValidationTimeout])
+    clearTimeout(socket[kIdleSocketValidationTimeout])
     socket[kIdleSocketValidationTimeout] = null
   }
 
@@ -25601,23 +25353,15 @@ function clearIdleSocketValidation (socket) {
 
 function scheduleIdleSocketValidation (client, socket) {
   socket[kIdleSocketValidation] = 1
-  // Yield to the check phase (after poll) so unsolicited bytes / FIN / RST
-  // already pending on this idle keep-alive socket are processed before the
-  // next request is written (GHSA-35p6-xmwp-9g52).
-  //
-  // setTimeout(0) pays Node's ~1ms timer floor on every sequential reuse
-  // (#5493). setImmediate avoids that, but an *unref'd* Immediate lets poll
-  // block for ~500ms when the event loop is otherwise idle (#5600 / #5606).
-  // A ref'd Immediate both keeps the pending request alive and makes poll
-  // return immediately — the hybrid those issues asked for.
-  socket[kIdleSocketValidationTimeout] = setImmediate(() => {
+  socket[kIdleSocketValidationTimeout] = setTimeout(() => {
     socket[kIdleSocketValidationTimeout] = null
     socket[kIdleSocketValidation] = 2
 
     if (client[kSocket] === socket && !socket.destroyed) {
       client[kResume]()
     }
-  })
+  }, 0)
+  socket[kIdleSocketValidationTimeout].unref?.()
 }
 
 /**
@@ -25766,22 +25510,12 @@ function writeH1 (client, request) {
   const socket = client[kSocket]
   clearIdleSocketValidation(socket)
 
-  /**
-   * @param {Error} [error]
-   */
-  const abort = (error) => {
-    if (request.aborted) {
+  const abort = (err) => {
+    if (request.aborted || request.completed) {
       return
     }
 
-    if (request.completed) {
-      if (request.upgrade || request.method === 'CONNECT') {
-        util.destroy(socket, new InformationalError('aborted'))
-      }
-      return
-    }
-
-    util.errorRequest(client, request, error || new RequestAbortedError())
+    util.errorRequest(client, request, err || new RequestAbortedError())
 
     util.destroy(body)
     util.destroy(socket, new InformationalError('aborted'))
@@ -26238,7 +25972,6 @@ module.exports = connectH1
 
 
 const assert = __nccwpck_require__(4589)
-const { errorMonitor } = __nccwpck_require__(8474)
 const { pipeline } = __nccwpck_require__(7075)
 const util = __nccwpck_require__(3440)
 const {
@@ -26315,15 +26048,6 @@ function parseH2Headers (headers) {
   return result
 }
 
-/**
- * @param {import('node:http2').IncomingHttpHeaders} headers
- * @returns {Buffer[]}
- */
-function parseH2ResponseHeaders (headers) {
-  const { [HTTP2_HEADER_STATUS]: _statusCode, ...realHeaders } = headers
-  return parseH2Headers(realHeaders)
-}
-
 async function connectH2 (client, socket) {
   client[kSocket] = socket
 
@@ -26373,6 +26097,8 @@ async function connectH2 (client, socket) {
   socket[kHTTP2Session] = session
 
   util.addListener(socket, 'error', function (err) {
+    assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
+
     this[kError] = err
 
     this[kClient][kOnError](err)
@@ -26446,6 +26172,8 @@ function resumeH2 (client) {
 }
 
 function onHttp2SessionError (err) {
+  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
+
   this[kSocket][kError] = err
   this[kClient][kOnError](err)
 }
@@ -26540,32 +26268,22 @@ function writeH2 (client, request) {
   headers[HTTP2_HEADER_AUTHORITY] = host || `${hostname}${port ? `:${port}` : ''}`
   headers[HTTP2_HEADER_METHOD] = method
 
-  /**
-   * @param {Error} [error]
-   */
-  const abort = (error) => {
-    if (request.aborted) {
+  const abort = (err) => {
+    if (request.aborted || request.completed) {
       return
     }
 
-    if (request.completed) {
-      if (method === 'CONNECT' && stream != null) {
-        util.destroy(stream, error || new RequestAbortedError())
-      }
-      return
-    }
+    err = err || new RequestAbortedError()
 
-    error = error || new RequestAbortedError()
-
-    util.errorRequest(client, request, error)
+    util.errorRequest(client, request, err)
 
     if (stream != null) {
-      util.destroy(stream, error)
+      util.destroy(stream, err)
     }
 
     // We do not destroy the socket as we can continue using the session
     // the stream get's destroyed and the session remains to create new streams
-    util.destroy(body, error)
+    util.destroy(body, err)
     client[kQueue][client[kRunningIdx]++] = null
     client[kResume]()
   }
@@ -26584,57 +26302,25 @@ function writeH2 (client, request) {
 
   if (method === 'CONNECT') {
     session.ref()
+    // We are already connected, streams are pending, first request
+    // will create a new stream. We trigger a request to create the stream and wait until
+    // `ready` event is triggered
     // We disabled endStream to allow the user to write to the stream
     stream = session.request(headers, { endStream: false, signal })
-    let upgradeResponseFinished = false
 
-    /**
-     * @param {import('node:http2').IncomingHttpHeaders} headers
-     */
-    const onResponse = (headers) => {
-      upgradeResponseFinished = true
-      stream.off(errorMonitor, onUpgradeError)
-      request.onUpgradeResponse(Number(headers[HTTP2_HEADER_STATUS]), headers, parseH2ResponseHeaders)
-    }
-
-    /**
-     * @param {Error} error
-     */
-    const onUpgradeError = (error) => {
-      upgradeResponseFinished = true
-      stream.off('response', onResponse)
-      request.onUpgradeError(error)
-    }
-
-    const onReady = () => {
-      try {
-        request.onUpgrade(null, null, stream)
-      } catch (error) {
-        stream.off('response', onResponse)
-        abort(error)
-        return
-      }
-
-      if (request.aborted) {
-        return
-      }
-
-      stream.off('error', abort)
-      stream.once(errorMonitor, onUpgradeError)
+    if (stream.id && !stream.pending) {
+      request.onUpgrade(null, null, stream)
+      ++session[kOpenStreams]
       client[kQueue][client[kRunningIdx]++] = null
+    } else {
+      stream.once('ready', () => {
+        request.onUpgrade(null, null, stream)
+        ++session[kOpenStreams]
+        client[kQueue][client[kRunningIdx]++] = null
+      })
     }
-
-    stream.once('response', onResponse)
-    stream.once('error', abort)
-    ++session[kOpenStreams]
-    onReady()
 
     stream.once('close', () => {
-      if (!upgradeResponseFinished && request.completed) {
-        stream.off('response', onResponse)
-        stream.off(errorMonitor, onUpgradeError)
-        request.onUpgradeError(new InformationalError(`HTTP/2: "stream error" received - code ${stream.rstCode}`))
-      }
       session[kOpenStreams] -= 1
       if (session[kOpenStreams] === 0) session.unref()
     })
@@ -27143,10 +26829,9 @@ class Client extends DispatcherBase {
     // h2
     maxConcurrentStreams,
     allowH2,
-    webSocket,
-    eventSource
+    webSocket
   } = {}) {
-    super({ webSocket, eventSource })
+    super({ webSocket })
 
     if (keepAlive !== undefined) {
       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
@@ -27667,7 +27352,6 @@ module.exports = Client
 
 
 
-const buffer = __nccwpck_require__(4573)
 const Dispatcher = __nccwpck_require__(883)
 const {
   ClientDestroyedError,
@@ -27680,7 +27364,6 @@ const kOnDestroyed = Symbol('onDestroyed')
 const kOnClosed = Symbol('onClosed')
 const kInterceptedDispatch = Symbol('Intercepted Dispatch')
 const kWebSocketOptions = Symbol('webSocketOptions')
-const kEventSourceOptions = Symbol('eventSourceOptions')
 
 class DispatcherBase extends Dispatcher {
   constructor (opts) {
@@ -27691,19 +27374,12 @@ class DispatcherBase extends Dispatcher {
     this[kClosed] = false
     this[kOnClosed] = []
     this[kWebSocketOptions] = opts?.webSocket ?? {}
-    this[kEventSourceOptions] = opts?.eventSource ?? {}
   }
 
   get webSocketOptions () {
     return {
       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
-    }
-  }
-
-  get eventSourceOptions () {
-    return {
-      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
     }
   }
 
@@ -29343,7 +29019,6 @@ class RetryHandler {
     this.end = null
     this.etag = null
     this.resume = null
-    this.headersSent = false
 
     // Handle possible onConnect duplication
     this.handler.onConnect(reason => {
@@ -29354,20 +29029,6 @@ class RetryHandler {
         this.reason = reason
       }
     })
-  }
-
-  checkpointResponseEnd (headers, resume) {
-    if (this.end == null && this.opts.method !== 'HEAD') {
-      const contentLength = headers['content-length']
-      this.end = contentLength != null ? Number(contentLength) - 1 : null
-
-      assert(
-        this.end == null || Number.isFinite(this.end),
-        'invalid content-length'
-      )
-    }
-
-    this.resume = this.end != null ? resume : null
   }
 
   onRequestSent () {
@@ -29458,12 +29119,7 @@ class RetryHandler {
     this.retryCount += 1
 
     if (statusCode >= 300) {
-      // Only expose a response if no earlier attempt has reached the caller.
-      // Otherwise abort this attempt so the error settles the existing body
-      // instead of replacing it with a new response.
-      if (!this.headersSent && this.retryOpts.statusCodes.includes(statusCode) === false) {
-        this.headersSent = true
-        this.checkpointResponseEnd(headers, resume)
+      if (this.retryOpts.statusCodes.includes(statusCode) === false) {
         return this.handler.onHeaders(
           statusCode,
           rawHeaders,
@@ -29532,15 +29188,8 @@ class RetryHandler {
 
       const { start, size, end = size - 1 } = contentRange
 
-      if (this.start !== start || (this.end != null && this.end !== end)) {
-        this.abort(
-          new RequestRetryError('Content-Range mismatch', statusCode, {
-            headers,
-            data: { count: this.retryCount }
-          })
-        )
-        return false
-      }
+      assert(this.start === start, 'content-range mismatch')
+      assert(this.end == null || this.end === end, 'content-range mismatch')
 
       this.resume = resume
       return true
@@ -29552,7 +29201,6 @@ class RetryHandler {
         const range = parseRangeHeader(headers['content-range'])
 
         if (range == null) {
-          this.headersSent = true
           return this.handler.onHeaders(
             statusCode,
             rawHeaders,
@@ -29591,7 +29239,6 @@ class RetryHandler {
       )
 
       this.resume = resume
-      this.headersSent = true
       this.etag = headers.etag != null ? headers.etag : null
 
       // Weak etags are not useful for comparison nor cache
@@ -29631,7 +29278,7 @@ class RetryHandler {
   }
 
   onError (err) {
-    if (this.aborted || isDisturbed(this.opts.body) || (this.headersSent && this.resume == null)) {
+    if (this.aborted || isDisturbed(this.opts.body)) {
       return this.handler.onError(err)
     }
 
@@ -34065,7 +33712,6 @@ module.exports = {
 /***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
 
 
-const buffer = __nccwpck_require__(4573)
 const { Transform } = __nccwpck_require__(7075)
 const { isASCIINumber, isValidLastEventId } = __nccwpck_require__(4811)
 
@@ -34089,63 +33735,6 @@ const COLON = 0x3A
  * @type {32} SPACE
  */
 const SPACE = 0x20
-
-const defaultMaxEventSize = buffer.kStringMaxLength
-
-const DATA = Buffer.from('data')
-const EVENT = Buffer.from('event')
-const ID = Buffer.from('id')
-const RETRY = Buffer.from('retry')
-
-// Each data field creates a string node, and each unconsumed input chunk keeps
-// a Buffer wrapper. The absolute ceiling protects the large default byte limit.
-const minParserItems = 1024
-const maxParserItems = 131072
-const bytesPerParserItem = 128
-
-function isASCIINumberBytes (buffer, start) {
-  if (start >= buffer.length) {
-    return false
-  }
-
-  for (let i = start; i < buffer.length; i++) {
-    if (buffer[i] < 0x30 || buffer[i] > 0x39) {
-      return false
-    }
-  }
-
-  return true
-}
-
-function isValidLastEventIdBytes (buffer, start) {
-  for (let i = start; i < buffer.length; i++) {
-    if (buffer[i] === 0x00) {
-      return false
-    }
-  }
-
-  return true
-}
-
-function isFieldName (line, length, field) {
-  if (length !== field.length) {
-    return false
-  }
-
-  for (let i = 0; i < length; i++) {
-    if (line[i] !== field[i]) {
-      return false
-    }
-  }
-
-  return true
-}
-
-function createMaxEventSizeExceededError () {
-  const error = new Error('EventSource message size exceeded')
-  error.aborted = false
-  return error
-}
 
 /**
  * @typedef {object} EventSourceStreamEvent
@@ -34187,21 +33776,11 @@ class EventSourceStream extends Transform {
   eventEndCheck = false
 
   /**
-   * @type {Buffer[]}
+   * @type {Buffer}
    */
-  chunks = []
+  buffer = null
 
-  chunkIndex = 0
   pos = 0
-  lineChunkIndex = 0
-  linePos = 0
-  lineLength = 0
-  eventSize = 0
-  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
-  dataLineCount = 0
-  maxEventSize
-  maxDataLines
-  maxBufferedChunks
 
   event = {
     data: undefined,
@@ -34212,7 +33791,6 @@ class EventSourceStream extends Transform {
 
   /**
    * @param {object} options
-   * @param {number} [options.maxEventSize]
    * @param {eventSourceSettings} options.eventSourceSettings
    * @param {Function} [options.push]
    */
@@ -34224,12 +33802,6 @@ class EventSourceStream extends Transform {
     super(options)
 
     this.state = options.eventSourceSettings || {}
-    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
-    const parserItemLimit = this.maxEventSize > 0
-      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
-      : 0
-    this.maxDataLines = parserItemLimit
-    this.maxBufferedChunks = parserItemLimit
     if (options.push) {
       this.push = options.push
     }
@@ -34247,28 +33819,92 @@ class EventSourceStream extends Transform {
       return
     }
 
-    // A leading line ending can immediately release the currently buffered
-    // line, even when it uses the final allowed chunk slot.
-    if (this.maxEventSize > 0 &&
-        this.chunks.length >= this.maxBufferedChunks &&
-        chunk[0] !== LF && chunk[0] !== CR) {
-      callback(createMaxEventSizeExceededError())
-      return
+    // Cache the chunk in the buffer, as the data might not be complete while
+    // processing it
+    // TODO: Investigate if there is a more performant way to handle
+    // incoming chunks
+    // see: https://github.com/nodejs/undici/issues/2630
+    if (this.buffer) {
+      this.buffer = Buffer.concat([this.buffer, chunk])
+    } else {
+      this.buffer = chunk
     }
-    this.chunks.push(chunk)
 
     // Strip leading byte-order-mark if we opened the stream and started
     // the processing of the incoming data
     if (this.checkBOM) {
-      if (this.handleBOM()) {
-        callback()
-        return
+      switch (this.buffer.length) {
+        case 1:
+          // Check if the first byte is the same as the first byte of the BOM
+          if (this.buffer[0] === BOM[0]) {
+            // If it is, we need to wait for more data
+            callback()
+            return
+          }
+          // Set the checkBOM flag to false as we don't need to check for the
+          // BOM anymore
+          this.checkBOM = false
+
+          // The buffer only contains one byte so we need to wait for more data
+          callback()
+          return
+        case 2:
+          // Check if the first two bytes are the same as the first two bytes
+          // of the BOM
+          if (
+            this.buffer[0] === BOM[0] &&
+            this.buffer[1] === BOM[1]
+          ) {
+            // If it is, we need to wait for more data, because the third byte
+            // is needed to determine if it is the BOM or not
+            callback()
+            return
+          }
+
+          // Set the checkBOM flag to false as we don't need to check for the
+          // BOM anymore
+          this.checkBOM = false
+          break
+        case 3:
+          // Check if the first three bytes are the same as the first three
+          // bytes of the BOM
+          if (
+            this.buffer[0] === BOM[0] &&
+            this.buffer[1] === BOM[1] &&
+            this.buffer[2] === BOM[2]
+          ) {
+            // If it is, we can drop the buffered data, as it is only the BOM
+            this.buffer = Buffer.alloc(0)
+            // Set the checkBOM flag to false as we don't need to check for the
+            // BOM anymore
+            this.checkBOM = false
+
+            // Await more data
+            callback()
+            return
+          }
+          // If it is not the BOM, we can start processing the data
+          this.checkBOM = false
+          break
+        default:
+          // The buffer is longer than 3 bytes, so we can drop the BOM if it is
+          // present
+          if (
+            this.buffer[0] === BOM[0] &&
+            this.buffer[1] === BOM[1] &&
+            this.buffer[2] === BOM[2]
+          ) {
+            // Remove the BOM from the buffer
+            this.buffer = this.buffer.subarray(3)
+          }
+
+          // Set the checkBOM flag to false as we don't need to check for the
+          this.checkBOM = false
+          break
       }
     }
 
-    while (this.hasCurrentByte()) {
-      const byte = this.currentByte()
-
+    while (this.pos < this.buffer.length) {
       // If the previous line ended with an end-of-line, we need to check
       // if the next character is also an end-of-line.
       if (this.eventEndCheck) {
@@ -34281,9 +33917,10 @@ class EventSourceStream extends Transform {
         if (this.crlfCheck) {
           // If the current character is a line feed, we can remove it
           // from the buffer and reset the crlfCheck flag
-          if (byte === LF) {
+          if (this.buffer[this.pos] === LF) {
+            this.buffer = this.buffer.subarray(this.pos + 1)
+            this.pos = 0
             this.crlfCheck = false
-            this.consumeCurrentByte()
 
             // It is possible that the line feed is not the end of the
             // event. We need to check if the next character is an
@@ -34299,17 +33936,19 @@ class EventSourceStream extends Transform {
           this.crlfCheck = false
         }
 
-        if (byte === LF || byte === CR) {
+        if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
           // If the current character is a carriage return, we need to
           // set the crlfCheck flag to true, as we need to check if the
           // next character is a line feed so we can remove it from the
           // buffer
-          if (byte === CR) {
+          if (this.buffer[this.pos] === CR) {
             this.crlfCheck = true
           }
 
-          this.consumeCurrentByte()
-          if (this.hasPendingEvent()) {
+          this.buffer = this.buffer.subarray(this.pos + 1)
+          this.pos = 0
+          if (
+            this.event.data !== undefined || this.event.event || this.event.id || this.event.retry) {
             this.processEvent(this.event)
           }
           this.clearEvent()
@@ -34323,23 +33962,22 @@ class EventSourceStream extends Transform {
 
       // If the current character is an end-of-line, we can process the
       // line
-      if (byte === LF || byte === CR) {
+      if (this.buffer[this.pos] === LF || this.buffer[this.pos] === CR) {
         // If the current character is a carriage return, we need to
         // set the crlfCheck flag to true, as we need to check if the
         // next character is a line feed
-        if (byte === CR) {
+        if (this.buffer[this.pos] === CR) {
           this.crlfCheck = true
         }
 
         // In any case, we can process the line as we reached an
         // end-of-line character
-        try {
-          this.parseLine(this.readLine(), this.event)
-        } catch (error) {
-          callback(error)
-          return
-        }
-        this.consumeCurrentByte()
+        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
+
+        // Remove the processed line from the buffer
+        this.buffer = this.buffer.subarray(this.pos + 1)
+        // Reset the position as we removed the processed line from the buffer
+        this.pos = 0
         // A line was processed and this could be the end of the event. We need
         // to check if the next line is empty to determine if the event is
         // finished.
@@ -34347,28 +33985,15 @@ class EventSourceStream extends Transform {
         continue
       }
 
-      // readLine() is only called after CR or LF. Reject an unfinished line
-      // before it can retain an unbounded number of decoded chunks. The seven
-      // extra bytes allow the longest field prefix ("event: " or "retry: ").
-      if (this.maxEventSize > 0 && ++this.lineLength > this.maxEventSize + 7) {
-        callback(createMaxEventSizeExceededError())
-        return
-      }
-      this.advanceCursor()
+      this.pos++
     }
 
     callback()
   }
 
-  _destroy (error, callback) {
-    this.chunks.length = 0
-    this.clearEvent()
-    super._destroy(error, callback)
-  }
-
   /**
    * @param {Buffer} line
-   * @param {EventSourceStreamEvent} event
+   * @param {EventStreamEvent} event
    */
   parseLine (line, event) {
     // If the line is empty (a blank line)
@@ -34385,72 +34010,65 @@ class EventSourceStream extends Transform {
       return
     }
 
-    let fieldLength = line.length
-    let valueStart = line.length
+    let field = ''
+    let value = ''
 
     // If the line contains a U+003A COLON character (:)
     if (colonPosition !== -1) {
-      fieldLength = colonPosition
+      // Collect the characters on the line before the first U+003A COLON
+      // character (:), and let field be that string.
+      // TODO: Investigate if there is a more performant way to extract the
+      // field
+      // see: https://github.com/nodejs/undici/issues/2630
+      field = line.subarray(0, colonPosition).toString('utf8')
 
       // Collect the characters on the line after the first U+003A COLON
       // character (:), and let value be that string.
       // If value starts with a U+0020 SPACE character, remove it from value.
-      valueStart = colonPosition + 1
+      let valueStart = colonPosition + 1
       if (line[valueStart] === SPACE) {
         ++valueStart
       }
+      // TODO: Investigate if there is a more performant way to extract the
+      // value
+      // see: https://github.com/nodejs/undici/issues/2630
+      value = line.subarray(valueStart).toString('utf8')
+
+      // Otherwise, the string is not empty but does not contain a U+003A COLON
+      // character (:)
+    } else {
+      // Process the field using the steps described below, using the whole
+      // line as the field name, and the empty string as the field value.
+      field = line.toString('utf8')
+      value = ''
     }
 
-    if (isFieldName(line, fieldLength, DATA)) {
-      if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
-        throw createMaxEventSizeExceededError()
-      }
-      const valueBytes = line.length - valueStart
-      const dataSize = this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes
-      this.setEventFieldSize('data', dataSize)
-
-      const value = line.toString('utf8', valueStart)
-
-      if (event.data === undefined) {
-        event.data = value
-      } else {
-        event.data += `\n${value}`
-      }
-      this.dataLineCount++
-      return
+    // Modify the event with the field name and value. The value is also
+    // decoded as UTF-8
+    switch (field) {
+      case 'data':
+        if (event[field] === undefined) {
+          event[field] = value
+        } else {
+          event[field] += `\n${value}`
+        }
+        break
+      case 'retry':
+        if (isASCIINumber(value)) {
+          event[field] = value
+        }
+        break
+      case 'id':
+        if (isValidLastEventId(value)) {
+          event[field] = value
+        }
+        break
+      case 'event':
+        if (value.length > 0) {
+          event[field] = value
+        }
+        break
     }
-
-    if (isFieldName(line, fieldLength, RETRY)) {
-      if (isASCIINumberBytes(line, valueStart)) {
-        this.setEventFieldSize('retry', line.length - valueStart)
-        event.retry = line.toString('utf8', valueStart)
-      }
-      return
-    }
-
-    if (isFieldName(line, fieldLength, ID)) {
-      if (isValidLastEventIdBytes(line, valueStart)) {
-        this.setEventFieldSize('id', line.length - valueStart)
-        event.id = line.toString('utf8', valueStart)
-      }
-      return
-    }
-
-    if (isFieldName(line, fieldLength, EVENT)) {
-      if (valueStart < line.length) {
-        this.setEventFieldSize('event', line.length - valueStart)
-        event.event = line.toString('utf8', valueStart)
-      }
-    }
-  }
-
-  setEventFieldSize (field, size) {
-    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
-    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
-      throw createMaxEventSizeExceededError()
-    }
-    this.eventSize = eventSize
-    this.eventFieldSizes[field] = size
   }
 
   /**
@@ -34479,159 +34097,12 @@ class EventSourceStream extends Transform {
   }
 
   clearEvent () {
-    this.event.data = undefined
-    this.event.event = undefined
-    this.event.id = undefined
-    this.event.retry = undefined
-    this.eventSize = 0
-    this.dataLineCount = 0
-    this.eventFieldSizes.data = 0
-    this.eventFieldSizes.event = 0
-    this.eventFieldSizes.id = 0
-    this.eventFieldSizes.retry = 0
-  }
-
-  hasPendingEvent () {
-    return this.event.data !== undefined ||
-      this.event.event !== undefined ||
-      this.event.id !== undefined ||
-      this.event.retry !== undefined
-  }
-
-  hasCurrentByte () {
-    return this.chunkIndex < this.chunks.length &&
-      this.pos < this.chunks[this.chunkIndex].length
-  }
-
-  currentByte () {
-    return this.chunks[this.chunkIndex][this.pos]
-  }
-
-  consumeCurrentByte () {
-    this.advanceCursor()
-    this.syncLineStartToCursor()
-  }
-
-  advanceCursor () {
-    this.pos++
-
-    while (this.chunkIndex < this.chunks.length && this.pos >= this.chunks[this.chunkIndex].length) {
-      this.chunkIndex++
-      this.pos = 0
+    this.event = {
+      data: undefined,
+      event: undefined,
+      id: undefined,
+      retry: undefined
     }
-  }
-
-  syncLineStartToCursor () {
-    this.lineChunkIndex = this.chunkIndex
-    this.linePos = this.pos
-    this.lineLength = 0
-    this.dropConsumedChunks()
-  }
-
-  dropConsumedChunks () {
-    if (this.lineChunkIndex > 0) {
-      const consumed = this.lineChunkIndex
-      this.chunks.splice(0, consumed)
-      this.lineChunkIndex = 0
-      this.chunkIndex -= consumed
-    }
-
-    if (this.chunkIndex === this.chunks.length) {
-      this.chunks.length = 0
-      this.chunkIndex = 0
-      this.pos = 0
-      this.lineChunkIndex = 0
-      this.linePos = 0
-    }
-  }
-
-  readLine () {
-    if (this.lineChunkIndex === this.chunkIndex) {
-      return this.chunks[this.chunkIndex].subarray(this.linePos, this.pos)
-    }
-
-    const chunks = []
-    let length = 0
-
-    for (let i = this.lineChunkIndex; i <= this.chunkIndex; i++) {
-      const chunk = this.chunks[i]
-      const start = i === this.lineChunkIndex ? this.linePos : 0
-      const end = i === this.chunkIndex ? this.pos : chunk.length
-      const slice = chunk.subarray(start, end)
-      length += slice.length
-      chunks.push(slice)
-    }
-
-    return Buffer.concat(chunks, length)
-  }
-
-  peekBufferedByte (offset) {
-    let chunkIndex = this.lineChunkIndex
-    let pos = this.linePos
-
-    while (chunkIndex < this.chunks.length) {
-      const chunk = this.chunks[chunkIndex]
-      const remaining = chunk.length - pos
-
-      if (offset < remaining) {
-        return chunk[pos + offset]
-      }
-
-      offset -= remaining
-      chunkIndex++
-      pos = 0
-    }
-  }
-
-  discardLeadingBytes (count) {
-    while (count > 0 && this.lineChunkIndex < this.chunks.length) {
-      const chunk = this.chunks[this.lineChunkIndex]
-      const remaining = chunk.length - this.linePos
-
-      if (count < remaining) {
-        this.linePos += count
-        count = 0
-      } else {
-        count -= remaining
-        this.lineChunkIndex++
-        this.linePos = 0
-      }
-    }
-
-    this.chunkIndex = this.lineChunkIndex
-    this.pos = this.linePos
-    this.dropConsumedChunks()
-  }
-
-  handleBOM () {
-    const first = this.peekBufferedByte(0)
-    const second = this.peekBufferedByte(1)
-    const third = this.peekBufferedByte(2)
-
-    if (second === undefined) {
-      if (first === BOM[0]) {
-        return true
-      }
-
-      this.checkBOM = false
-      return true
-    }
-
-    if (third === undefined) {
-      if (first === BOM[0] && second === BOM[1]) {
-        return true
-      }
-
-      this.checkBOM = false
-      return false
-    }
-
-    if (first === BOM[0] && second === BOM[1] && third === BOM[2]) {
-      this.discardLeadingBytes(3)
-    }
-
-    this.checkBOM = false
-    return !this.hasCurrentByte()
   }
 }
 
@@ -34658,7 +34129,6 @@ const { isNetworkError } = __nccwpck_require__(9051)
 const { delay } = __nccwpck_require__(4811)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { environmentSettingsObject } = __nccwpck_require__(3168)
-const { getGlobalDispatcher } = __nccwpck_require__(2581)
 
 let experimentalWarned = false
 
@@ -34940,7 +34410,6 @@ class EventSource extends EventTarget {
 
       const eventSourceStream = new EventSourceStream({
         eventSourceSettings: this.#state,
-        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
         push: (event) => {
           this.dispatchEvent(createFastMessageEvent(
             event.type,
@@ -35119,8 +34588,7 @@ webidl.converters.EventSourceInitDict = webidl.dictionaryConverter([
   },
   {
     key: 'dispatcher', // undici only
-    converter: webidl.converters.any,
-    defaultValue: () => getGlobalDispatcher()
+    converter: webidl.converters.any
   }
 ])
 
@@ -40216,10 +39684,8 @@ async function httpNetworkFetch (
   // 19. Run these steps in parallel:
 
   //    1. Run these steps, but abort when fetchParams is canceled:
-  if (!fetchParams.controller.resume) {
-    fetchParams.controller.on('terminated', onAborted)
-  }
-
+  fetchParams.controller.onAborted = onAborted
+  fetchParams.controller.on('terminated', onAborted)
   fetchParams.controller.resume = async () => {
     // 1. While true
     while (true) {
@@ -40388,6 +39854,8 @@ async function httpNetworkFetch (
           }
           location = headersList.get('location', true)
 
+          this.body = new Readable({ read: resume })
+
           const decoders = []
 
           const willFollow = location && request.redirect === 'follow' &&
@@ -40405,7 +39873,7 @@ async function httpNetworkFetch (
             // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
             const maxContentEncodings = 5
             if (codings.length > maxContentEncodings) {
-              this.abort(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
+              reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
               return true
             }
 
@@ -40437,8 +39905,6 @@ async function httpNetworkFetch (
               }
             }
           }
-
-          this.body = new Readable({ read: resume })
 
           const onError = this.onError.bind(this)
 
@@ -40484,6 +39950,10 @@ async function httpNetworkFetch (
         onComplete () {
           if (this.abort) {
             fetchParams.controller.off('terminated', this.abort)
+          }
+
+          if (fetchParams.controller.onAborted) {
+            fetchParams.controller.off('terminated', fetchParams.controller.onAborted)
           }
 
           fetchParams.controller.ended = true
@@ -45901,7 +45371,7 @@ function establishWebSocketConnection (url, protocols, client, ws, onEstablish, 
         // is specified, the server needs to include the same field and one of
         // the selected subprotocol values in its response for the connection to
         // be established.
-        if (requestProtocols === null || !requestProtocols.includes(secProtocol)) {
+        if (!requestProtocols.includes(secProtocol)) {
           failWebsocketConnection(ws, 'Protocol was not set in the opening handshake.')
           return
         }
@@ -46662,12 +46132,7 @@ class PerMessageDeflate {
 
         if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
           callback(new MessageSizeExceededError())
-          // The inflater may still hold buffered input that can emit a late
-          // zlib error. Remove the data listener, then deterministically stop
-          // the stream so a subsequent 'error' cannot fire without a listener
-          // (which would terminate the process as an unhandled error event).
           this.#inflate.removeAllListeners()
-          this.#inflate.destroy()
           this.#inflate = null
           return
         }
@@ -46960,20 +46425,6 @@ class ByteParser extends Writable {
         if (isControlFrame(this.#info.opcode)) {
           this.#loop = this.parseControlFrame(body)
           this.#state = parserStates.INFO
-
-          // If the automatic PONG/CLOSE reply filled the socket's write buffer,
-          // stop parsing and resume on drain so a PING flood cannot grow the
-          // outbound queue without bound.
-          const socket = this.ws[kResponse].socket
-          if (this.#loop && socket.writableNeedDrain) {
-            this.#loop = false
-            socket.once('drain', () => {
-              if (this.destroyed) return
-              this.#loop = true
-              this.run(callback)
-            })
-            return
-          }
         } else {
           if (!this.#info.compressed) {
             if (!this.writeFragments(body)) {
@@ -48305,7 +47756,7 @@ module.exports = {
 /***/ ((module, __unused_webpack___webpack_exports__, __nccwpck_require__) => {
 
 __nccwpck_require__.a(module, async (__webpack_handle_async_dependencies__, __webpack_async_result__) => { try {
-/* harmony import */ var _main_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(2820);
+/* harmony import */ var _main_js__WEBPACK_IMPORTED_MODULE_0__ = __nccwpck_require__(9118);
 /**
  * The entrypoint for the action.
  */
@@ -48317,7 +47768,7 @@ __webpack_async_result__();
 
 /***/ }),
 
-/***/ 2820:
+/***/ 9118:
 /***/ ((__unused_webpack_module, __webpack_exports__, __nccwpck_require__) => {
 
 
@@ -57270,65 +56721,12 @@ const utils_hasOwnProperty = (
     hasOwnProperty.call(obj, prop)
 )(Object.prototype);
 
-const isUnsafeObjectKey = (prop) =>
-  typeof prop === 'string' &&
-  (prop === '__proto__' || prop === 'constructor' || prop === 'prototype');
-
 /**
- * Determine whether an inherited object must be treated as a shared-prototype
- * boundary. Cross-realm Object.prototype objects cannot be distinguished
- * reliably from application-created null-prototype objects because their
- * properties are mutable, so all inherited terminal prototypes are excluded
- * as a fail-closed boundary. A null-prototype source still keeps its own
- * properties, as produced by mergeConfig and other safe materialization paths.
- *
- * @param {*} obj The object to inspect
- * @param {*} prototype The object's prototype
- * @param {boolean} source Whether obj is the original traversal source
- *
- * @returns {boolean} True when obj is a safe prototype traversal boundary
- */
-const isPrototypeBoundary = (obj, prototype, source) =>
-  obj === Object.prototype || (!source && prototype === null);
-
-/**
- * Determine whether an object can retain its identity through code paths that
- * add, replace, and remove config properties without bypassing unsafe-key
- * filtering. Immutable objects, unsafe-key-bearing objects, and objects with
- * accessor or restricted data properties must be materialized instead.
- *
- * @param {*} obj The object to inspect
- *
- * @returns {boolean} True when every own property is safe and fully mutable
- */
-const isSafeAndFullyMutable = (obj) => {
-  if (!Object.isExtensible(obj)) {
-    return false;
-  }
-
-  const props = Object.getOwnPropertyNames(obj);
-
-  if (Object.getOwnPropertySymbols) {
-    props.push(...Object.getOwnPropertySymbols(obj));
-  }
-
-  return props.every((prop) => {
-    if (isUnsafeObjectKey(prop)) {
-      return false;
-    }
-
-    const descriptor = Object.getOwnPropertyDescriptor(obj, prop);
-
-    return !!descriptor && descriptor.configurable && descriptor.writable === true;
-  });
-};
-
-/**
- * Walk the prototype chain (excluding the source realm's Object.prototype)
- * looking for an own `prop`. This distinguishes genuine own/inherited members
- * — including class accessors and template prototypes — from members injected
- * via Object.prototype pollution (e.g. `Object.prototype.username = '...'`),
- * which live on Object.prototype itself and are therefore never matched.
+ * Walk the prototype chain (excluding the shared Object.prototype) looking for
+ * an own `prop`. This distinguishes genuine own/inherited members — including
+ * class accessors and template prototypes — from members injected via
+ * Object.prototype pollution (e.g. `Object.prototype.username = '...'`), which
+ * live on Object.prototype itself and are therefore never matched.
  *
  * @param {*} thing The value whose chain to inspect
  * @param {string|symbol} prop The property key to look for
@@ -57339,22 +56737,16 @@ const hasOwnInPrototypeChain = (thing, prop) => {
   let obj = thing;
   const seen = [];
 
-  while (obj != null) {
+  while (obj != null && obj !== Object.prototype) {
     if (seen.indexOf(obj) !== -1) {
       return false;
     }
     seen.push(obj);
 
-    const prototype = getPrototypeOf(obj);
-
-    if (isPrototypeBoundary(obj, prototype, obj === thing)) {
-      return false;
-    }
-
     if (utils_hasOwnProperty(obj, prop)) {
       return true;
     }
-    obj = prototype;
+    obj = getPrototypeOf(obj);
   }
   return false;
 };
@@ -57372,69 +56764,6 @@ const hasOwnInPrototypeChain = (thing, prop) => {
  */
 const getSafeProp = (obj, prop) =>
   obj != null && hasOwnInPrototypeChain(obj, prop) ? obj[prop] : undefined;
-
-/**
- * Flatten an object and its application-defined prototype chain into a
- * null-prototype object. Members inherited only from the source realm's
- * Object.prototype are deliberately excluded, while class/template members
- * below that boundary are preserved.
- *
- * @param {*} thing The value to flatten
- *
- * @returns {*} A null-prototype copy, or the original value when it is already
- * structurally safe or is not an object
- */
-const toSafeFlatObject = (thing) => {
-  if (thing == null || (typeof thing !== 'object' && typeof thing !== 'function')) {
-    return thing;
-  }
-
-  const sourcePrototype = getPrototypeOf(thing);
-
-  if (sourcePrototype === null && isSafeAndFullyMutable(thing)) {
-    return thing;
-  }
-
-  const result = Object.create(null);
-  const merged = Object.create(null);
-  const seen = [];
-  let current = thing;
-
-  while (current != null) {
-    if (seen.indexOf(current) !== -1) {
-      break;
-    }
-
-    seen.push(current);
-
-    const prototype = current === thing ? sourcePrototype : getPrototypeOf(current);
-
-    if (isPrototypeBoundary(current, prototype, current === thing)) {
-      break;
-    }
-
-    const props = Object.getOwnPropertyNames(current);
-
-    if (Object.getOwnPropertySymbols) {
-      props.push(...Object.getOwnPropertySymbols(current));
-    }
-
-    for (const prop of props) {
-      if (isUnsafeObjectKey(prop)) {
-        continue;
-      }
-
-      if (!utils_hasOwnProperty(merged, prop)) {
-        result[prop] = thing[prop];
-        merged[prop] = true;
-      }
-    }
-
-    current = prototype;
-  }
-
-  return result;
-};
 
 const kindOf = ((cache) => (thing) => {
   const str = utils_toString.call(thing);
@@ -57567,18 +56896,14 @@ const utils_isPlainObject = (val) => {
 
   const prototype = getPrototypeOf(val);
   return (
-    (prototype === null || prototype === Object.prototype || getPrototypeOf(prototype) === null) &&
-    // Treat own Symbol.toStringTag or Symbol.iterator members as evidence the
-    // value is tagged/iterable, ignoring members reachable only through shared
-    // or terminal prototype boundaries. This is exactly what
-    // hasOwnInPrototypeChain(val, prop) computes here: every prototype admitted
-    // above (null, Object.prototype, or a terminal null-prototype template) is
-    // a boundary, so the walk never inspects anything but `val`'s own members,
-    // and stops before even those when `val` is itself the boundary
-    // Object.prototype. Checking that inline avoids allocating the walker's
-    // `seen` list twice per call on the mergeConfig / merge hot path.
-    (isPrototypeBoundary(val, prototype, true) ||
-      (!utils_hasOwnProperty(val, toStringTag) && !utils_hasOwnProperty(val, utils_iterator)))
+    (prototype === null ||
+      prototype === Object.prototype ||
+      getPrototypeOf(prototype) === null) &&
+    // Treat any genuine (non-Object.prototype-polluted) Symbol.toStringTag or
+    // Symbol.iterator as evidence the value is a tagged/iterable type rather
+    // than a plain object, while ignoring keys injected onto Object.prototype.
+    !hasOwnInPrototypeChain(val, toStringTag) &&
+    !hasOwnInPrototypeChain(val, utils_iterator)
   );
 };
 
@@ -57663,7 +56988,6 @@ const utils_isBlob = kindOfTest('Blob');
  * @returns {boolean} True if value is a FileList, otherwise false
  */
 const isFileList = kindOfTest('FileList');
-const isSet = kindOfTest('Set');
 
 /**
  * Determine if a value is a Stream
@@ -57842,30 +57166,15 @@ const isContextDefined = (context) => !isUndefined(context) && context !== _glob
 function utils_merge(...objs) {
   const { caseless, skipUndefined } = (isContextDefined(this) && this) || {};
   const result = {};
-  // Caseless lookup only applies to string keys — symbol keys are
-  // identity-matched. Every string key that reaches `result` passes through
-  // this index first, so it can never hold two case variants of one key and a
-  // lowercase -> key map is exactly what findKey(result, key) would rescan
-  // Object.keys(result) for on each assignment.
-  const lowerCaseKeys = caseless ? Object.create(null) : null;
   const assignValue = (val, key) => {
     // Skip dangerous property names to prevent prototype pollution
     if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
       return;
     }
 
-    let targetKey = key;
-    if (lowerCaseKeys && typeof key === 'string') {
-      const lowerKey = key.toLowerCase();
-      const knownKey = lowerCaseKeys[lowerKey];
-      // A key recorded but absent from `result` was skipped by skipUndefined;
-      // the later spelling wins then, as it does for findKey.
-      if (knownKey !== undefined && utils_hasOwnProperty(result, knownKey)) {
-        targetKey = knownKey;
-      } else {
-        lowerCaseKeys[lowerKey] = key;
-      }
-    }
+    // findKey lowercases the key, so caseless lookup only applies to strings —
+    // symbol keys are identity-matched.
+    const targetKey = (caseless && typeof key === 'string' && findKey(result, key)) || key;
     // Read via own-prop only — a bare `result[targetKey]` walks the prototype
     // chain, so a polluted Object.prototype value could surface here and get
     // copied into the merged result.
@@ -57889,7 +57198,7 @@ function utils_merge(...objs) {
 
     forEach(source, assignValue);
 
-    if (typeof source !== 'object' || isArray(source) || !Object.getOwnPropertySymbols) {
+    if (typeof source !== 'object' || isArray(source)) {
       continue;
     }
 
@@ -58048,37 +57357,7 @@ const toArray = (thing) => {
   if (!thing) return null;
   if (isArray(thing)) return thing;
   let i = thing.length;
-  if (!Number.isSafeInteger(i) || i < 0 || i > 0xffffffff) return null;
-
-  // Bound the copy by actual indexed properties, including hidden and inherited
-  // members of array-like collections, rather than by the declared length alone.
-  const indexes = new Set();
-  const seen = new Set();
-  let source = thing;
-
-  while (source != null && indexes.size < i) {
-    if (seen.has(source)) return null;
-    seen.add(source);
-
-    const prototype = getPrototypeOf(source);
-    if (isPrototypeBoundary(source, prototype, source === thing)) break;
-
-    Object.getOwnPropertyNames(source).forEach((key) => {
-      const index = +key;
-      if (
-        Number.isInteger(index) &&
-        index >= 0 &&
-        index < i &&
-        String(index) === key &&
-        utils_hasOwnProperty(source, key)
-      ) {
-        indexes.add(index);
-      }
-    });
-    source = prototype;
-  }
-
-  if (indexes.size !== i) return null;
+  if (!isNumber(i)) return null;
   const arr = new Array(i);
   while (i-- > 0) {
     arr[i] = thing[i];
@@ -58274,23 +57553,12 @@ const toJSONObject = (obj) => {
       if (!('toJSON' in source)) {
         // add-on descent / delete-on-ascent: preserves path semantics, so DAG nodes serialise at every occurrence (see #7230).
         visited.add(source);
+        const target = isArray(source) ? [] : {};
 
-        let target;
-
-        if (isSet(source)) {
-          target = [];
-          for (const value of source) {
-            const reducedValue = visit(value);
-            !isUndefined(reducedValue) && target.push(reducedValue);
-          }
-        } else {
-          target = isArray(source) ? [] : {};
-
-          forEach(source, (value, key) => {
-            const reducedValue = visit(value);
-            !isUndefined(reducedValue) && (target[key] = reducedValue);
-          });
-        }
+        forEach(source, (value, key) => {
+          const reducedValue = visit(value);
+          !isUndefined(reducedValue) && (target[key] = reducedValue);
+        });
 
         visited.delete(source);
 
@@ -58435,7 +57703,6 @@ const isSafeIterable = (thing) =>
   hasOwnProp: utils_hasOwnProperty, // an alias to avoid ESLint no-prototype-builtins detection
   hasOwnInPrototypeChain,
   getSafeProp,
-  toSafeFlatObject,
   reduceDescriptors,
   freezeMethods,
   toObjectSet,
@@ -58497,8 +57764,7 @@ const ignoreDuplicateOf = utils.toObjectSet([
  * @returns {Object} Headers parsed into an object
  */
 /* harmony default export */ const parseHeaders = ((rawHeaders) => {
-  // Header names are data, including __proto__; avoid inherited setters.
-  const parsed = Object.create(null);
+  const parsed = {};
   let key;
   let val;
   let i;
@@ -58509,20 +57775,18 @@ const ignoreDuplicateOf = utils.toObjectSet([
       key = line.substring(0, i).trim().toLowerCase();
       val = line.substring(i + 1).trim();
 
-      const hasKey = utils.hasOwnProp(parsed, key);
-
-      if (!key || (hasKey && utils.hasOwnProp(ignoreDuplicateOf, key))) {
+      if (!key || (parsed[key] && ignoreDuplicateOf[key])) {
         return;
       }
 
       if (key === 'set-cookie') {
-        if (hasKey) {
+        if (parsed[key]) {
           parsed[key].push(val);
         } else {
           parsed[key] = [val];
         }
       } else {
-        parsed[key] = hasKey ? parsed[key] + ', ' + val : val;
+        parsed[key] = parsed[key] ? parsed[key] + ', ' + val : val;
       }
     });
 
@@ -58624,142 +57888,11 @@ function parseTokens(str) {
   return tokens;
 }
 
-const parameterNameRE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
-
-function trimOWS(value) {
-  let start = 0;
-  let end = value.length;
-
-  while (start < end) {
-    const code = value.charCodeAt(start);
-
-    if (code !== 0x09 && code !== 0x20) {
-      break;
-    }
-
-    start += 1;
-  }
-
-  while (end > start) {
-    const code = value.charCodeAt(end - 1);
-
-    if (code !== 0x09 && code !== 0x20) {
-      break;
-    }
-
-    end -= 1;
-  }
-
-  return start === 0 && end === value.length ? value : value.slice(start, end);
-}
-
-function decodeQuotedString(value) {
-  const last = value.length - 1;
-
-  if (last < 1 || value.charCodeAt(0) !== 0x22 || value.charCodeAt(last) !== 0x22) {
-    return value;
-  }
-
-  let decoded = '';
-
-  for (let i = 1; i < last; i++) {
-    const code = value.charCodeAt(i);
-
-    if (code === 0x22) {
-      return value;
-    }
-
-    if (code === 0x5c) {
-      i += 1;
-
-      if (i >= last) {
-        return value;
-      }
-    }
-
-    decoded += value[i];
-  }
-
-  return decoded;
-}
-
-function parseParameters(value) {
-  const parameters = Object.create(null);
-  const str = String(value);
-  let start = 0;
-  let quoted = false;
-  let escaped = false;
-
-  function parseParameter(end) {
-    const part = trimOWS(str.slice(start, end));
-    const equals = part.indexOf('=');
-
-    if (equals < 1) {
-      return;
-    }
-
-    const name = trimOWS(part.slice(0, equals));
-
-    if (!parameterNameRE.test(name)) {
-      return;
-    }
-
-    const normalizedName = name.toLowerCase();
-
-    if (
-      normalizedName === '__proto__' ||
-      normalizedName === 'constructor' ||
-      normalizedName === 'prototype'
-    ) {
-      return;
-    }
-
-    const parameterValue = trimOWS(part.slice(equals + 1));
-    parameters[normalizedName] = decodeQuotedString(parameterValue);
-  }
-
-  for (let i = 0; i < str.length; i++) {
-    const code = str.charCodeAt(i);
-
-    if (quoted) {
-      if (escaped) {
-        escaped = false;
-      } else if (code === 0x5c) {
-        escaped = true;
-      } else if (code === 0x22) {
-        quoted = false;
-      }
-    } else if (code === 0x22) {
-      quoted = true;
-    } else if (code === 0x2c || code === 0x3b) {
-      parseParameter(i);
-      start = i + 1;
-    }
-  }
-
-  parseParameter(str.length);
-
-  return parameters;
-}
-
 const isValidHeaderName = (str) => /^[-_a-zA-Z0-9^`|~,!#$%&'*+.]+$/.test(str.trim());
-
-// `__proto__` is a valid field name, and the one name the uppercase mapping at
-// the bottom of this file cannot reach: it is inherited from Object.prototype
-// instead of being declared on AxiosHeaders.prototype, so `self.__proto__ = v`
-// runs the inherited setter. That silently discards the header, and an array
-// value replaces the instance prototype, taking every method with it.
-// Store it under the same kind of case variant that mapping uses for `set` and
-// `constructor`. Header lookup is caseless, so it reads back under either
-// spelling, and no own `__proto__` slot is ever created for a later
-// `Object.assign` to copy onto a plain object through the same setter.
-const PROTO_HEADER_SLOT = '__Proto__';
-
-const headerSlot = (name) => (name === '__proto__' ? PROTO_HEADER_SLOT : name);
 
 function matchHeaderValue(context, value, header, filter, isHeaderNameFilter) {
   if (utils.isFunction(filter)) {
-    return filter.call(context, value, header);
+    return filter.call(this, value, header);
   }
 
   if (isHeaderNameFilter) {
@@ -58825,7 +57958,7 @@ class AxiosHeaders {
         _rewrite === true ||
         (_rewrite === undefined && self[key] !== false)
       ) {
-        self[headerSlot(key || _header)] = normalizeValue(_value);
+        self[key || _header] = normalizeValue(_value);
       }
     }
 
@@ -58954,7 +58087,7 @@ class AxiosHeaders {
 
   normalize(format) {
     const self = this;
-    const headers = Object.create(null);
+    const headers = {};
 
     utils.forEach(this, (value, header) => {
       const key = utils.findKey(headers, header);
@@ -58965,7 +58098,7 @@ class AxiosHeaders {
         return;
       }
 
-      const normalized = headerSlot(format ? formatHeader(header) : String(header).trim());
+      const normalized = format ? formatHeader(header) : String(header).trim();
 
       if (normalized !== header) {
         delete self[header];
@@ -59006,8 +58139,7 @@ class AxiosHeaders {
   }
 
   getSetCookie() {
-    const value = this.get('set-cookie');
-    return utils.isArray(value) ? value : value == null || value === false ? [] : [value];
+    return this.get('set-cookie') || [];
   }
 
   get [Symbol.toStringTag]() {
@@ -59016,10 +58148,6 @@ class AxiosHeaders {
 
   static from(thing) {
     return thing instanceof this ? thing : new this(thing);
-  }
-
-  static parseParameters(value) {
-    return parseParameters(value);
   }
 
   static concat(first, ...targets) {
@@ -59155,95 +58283,9 @@ function redactConfig(config, redactKeys) {
   return visit(config);
 }
 
-function stringifySafely(value) {
-  try {
-    return String(value);
-  } catch (err) {
-    return '';
-  }
-}
-
-function aggregateErrorMessage(error) {
-  const message = error.errors
-    .map((entry) => {
-      try {
-        return entry && entry.message ? stringifySafely(entry.message) : stringifySafely(entry);
-      } catch (err) {
-        return '';
-      }
-    })
-    .filter(Boolean)
-    .join('; ');
-
-  return message || error.name || 'AggregateError';
-}
-
-// Shared with `Axios.prototype.request`, which splices the reconstructed
-// caller frames in ahead of this marker.
-const CAUSED_BY_SEPARATOR = '\nCaused by: ';
-const $causeStack = Symbol('causeStack');
-
-// Match the section we appended, not marker-like text in an error message or
-// a replacement stack supplied by the caller. Do not re-read the cause's stack.
-function getCauseStackIndex(error, stack) {
-  const causeStack = utils.hasOwnProp(error, $causeStack) && error[$causeStack];
-
-  return causeStack && stack.endsWith(causeStack) ? stack.length - causeStack.length : -1;
-}
-
-/**
- * Append the stack of a wrapped error to `target.stack`.
- *
- * `cause` already exposes the original error for tooling that walks the standard
- * cause chain, but many error reporters read `stack` and nothing else. Inlining
- * the wrapped stack there means those reporters surface the underlying failure
- * instead of the axios frames that normalized it (see #6670).
- *
- * Every read is defensive: a custom `Error.prepareStackTrace` hook, a runtime
- * without stack support, or a replaced `stack` property can leave the value
- * missing, non-string, or read-only, and normalizing an error must not throw
- * because of that.
- *
- * @param {Error} target The AxiosError being built.
- * @param {Error} source The error being wrapped.
- *
- * @returns {void}
- */
-function appendCauseStack(target, source) {
-  try {
-    const sourceStack = source && source.stack;
-
-    if (typeof sourceStack !== 'string' || !sourceStack) {
-      return;
-    }
-
-    const targetStack = target.stack;
-
-    if (typeof targetStack !== 'string' || !targetStack) {
-      return;
-    }
-
-    // Each call to `from()` creates a fresh target. Re-wrapping includes the
-    // previous stack verbatim, adding one cause section per wrap.
-    const causeStack = CAUSED_BY_SEPARATOR + sourceStack;
-    target.stack = targetStack + causeStack;
-    Object.defineProperty(target, $causeStack, { __proto__: null, value: causeStack });
-  } catch (e) {
-    // Ignore failures from custom stack hooks or un-writable stack properties.
-  }
-}
-
 class AxiosError extends Error {
   static from(error, code, config, request, response, customProps) {
-    // `AggregateError` (thrown by Node on dual-stack/Happy-Eyeballs connection
-    // failures) has an empty `message`; its detail lives in `errors[]`. Without
-    // this, the wrapped error surfaces with a blank message (see #6721).
-    let message = error.message;
-    if (!message && utils.isArray(error.errors) && error.errors.length) {
-      message = aggregateErrorMessage(error);
-    }
-
-    const axiosError = new AxiosError(message, code || error.code, config, request, response);
+    const axiosError = new AxiosError(error.message, code || error.code, config, request, response);
     // Match native `Error` `cause` semantics: non-enumerable. The wrapped
     // error often carries circular internals (sockets, requests, agents), so
     // an enumerable `cause` makes structured loggers (pino/winston) and any
@@ -59258,10 +58300,6 @@ class AxiosError extends Error {
       configurable: true,
     });
     axiosError.name = error.name;
-
-    // Inline the wrapped stack for reporters that read only `stack`; the `cause`
-    // property above already covers cause-aware tooling.
-    appendCauseStack(axiosError, error);
 
     // Preserve status from the original error if not already set from response
     if (error.status != null && axiosError.status == null) {
@@ -59367,26 +58405,12 @@ var form_data = __nccwpck_require__(6454);
 
 /* harmony default export */ const classes_FormData = (form_data);
 
-;// CONCATENATED MODULE: ./node_modules/axios/lib/platform/node/classes/Buffer.js
-
-
-/* harmony default export */ const classes_Buffer = ({
-  isBufferAvailable() {
-    return typeof Buffer !== 'undefined';
-  },
-
-  from(value) {
-    return Buffer.from(value);
-  }
-});
-
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/toFormData.js
 
 
 
 
 // temporary hotfix to avoid circular references until AxiosURLSearchParams is refactored
-
 
 
 // Default nesting limit shared with the inverse transform (formDataToJSON) so
@@ -59482,18 +58506,28 @@ function toFormData(obj, formData, options) {
   // eslint-disable-next-line no-param-reassign
   formData = formData || new (classes_FormData || FormData)();
 
-  const option = (name, fallback) => {
-    const value = utils.getSafeProp(options, name);
-    return utils.isUndefined(value) ? fallback : value;
-  };
+  // eslint-disable-next-line no-param-reassign
+  options = utils.toFlatObject(
+    options,
+    {
+      metaTokens: true,
+      dots: false,
+      indexes: false,
+    },
+    false,
+    function defined(option, source) {
+      // eslint-disable-next-line no-eq-null,eqeqeq
+      return !utils.isUndefined(source[option]);
+    }
+  );
 
-  const metaTokens = option('metaTokens', true);
+  const metaTokens = options.metaTokens;
   // eslint-disable-next-line no-use-before-define
-  const visitor = option('visitor') || defaultVisitor;
-  const dots = option('dots', false);
-  const indexes = option('indexes', false);
-  const _Blob = option('Blob') || (typeof Blob !== 'undefined' && Blob);
-  const maxDepth = option('maxDepth', DEFAULT_FORM_DATA_MAX_DEPTH);
+  const visitor = options.visitor || defaultVisitor;
+  const dots = options.dots;
+  const indexes = options.indexes;
+  const _Blob = options.Blob || (typeof Blob !== 'undefined' && Blob);
+  const maxDepth = options.maxDepth === undefined ? DEFAULT_FORM_DATA_MAX_DEPTH : options.maxDepth;
   const useBlob = _Blob && utils.isSpecCompliantForm(formData);
   const stack = [];
 
@@ -59520,13 +58554,10 @@ function toFormData(obj, formData, options) {
       if (useBlob && typeof _Blob === 'function') {
         return new _Blob([value]);
       }
-      if (classes_Buffer && classes_Buffer.isBufferAvailable()) {
-        return classes_Buffer.from(value);
+      if (typeof Buffer !== 'undefined') {
+        return Buffer.from(value);
       }
-      throw new core_AxiosError(
-        'Blob is not supported. Use a Buffer instead.',
-        core_AxiosError.ERR_NOT_SUPPORT
-      );
+      throw new core_AxiosError('Blob is not supported. Use a Buffer instead.', core_AxiosError.ERR_NOT_SUPPORT);
     }
 
     return value;
@@ -59798,67 +58829,9 @@ function buildURL(url, params, options) {
 
 
 
-const InterceptorManager_$internals = Symbol('internals');
-
-// `handlers` is public and may be replaced with a nullish value by user code;
-// `clear()` has always tolerated that. Treat it as an empty stack rather than
-// dereferencing it.
-function countHandlers(handlers) {
-  return handlers ? handlers.length : 0;
-}
-
-function trimHandlers(handlers) {
-  if (!handlers) {
-    return;
-  }
-
-  while (handlers.length && handlers[handlers.length - 1] === null) {
-    handlers.pop();
-  }
-}
-
-// Preserve the array-key coercion used before IDs were stored in a Map, without
-// treating null, empty strings, or noncanonical numeric strings as ID zero.
-function normalizeHandlerId(id) {
-  if (typeof id === 'string' && id !== '' && String(Number(id)) === id) {
-    return Number(id);
-  }
-
-  return id;
-}
-
-function syncHandlerEntries(manager, internals) {
-  const handlers = manager.handlers;
-  const length = countHandlers(handlers);
-
-  if (handlers !== internals.handlersRef) {
-    internals.handlersRef = handlers;
-    internals.handlerEntries.clear();
-  } else if (length !== internals.handlersLength) {
-    if (!length) {
-      internals.handlerEntries.clear();
-    } else {
-      internals.handlerEntries.forEach(function removeStaleEntry(entry, id) {
-        if (handlers[entry.index] !== entry.handler) {
-          internals.handlerEntries.delete(id);
-        }
-      });
-    }
-  }
-
-  internals.handlersLength = length;
-}
-
 class InterceptorManager {
   constructor() {
     this.handlers = [];
-    this[InterceptorManager_$internals] = {
-      handlersRef: this.handlers,
-      handlersLength: this.handlers.length,
-      handlerEntries: new Map(),
-      iterationDepth: 0,
-      nextId: 0,
-    };
   }
 
   /**
@@ -59871,30 +58844,13 @@ class InterceptorManager {
    * @return {Number} An ID used to remove interceptor later
    */
   use(fulfilled, rejected, options) {
-    const handler = {
+    this.handlers.push({
       fulfilled,
       rejected,
       synchronous: options ? options.synchronous : false,
       runWhen: options ? options.runWhen : null,
-    };
-    const internals = this[InterceptorManager_$internals];
-
-    if (this.handlers == null) {
-      this.handlers = [];
-    }
-
-    syncHandlerEntries(this, internals);
-
-    const id = internals.nextId++;
-
-    this.handlers.push(handler);
-    internals.handlerEntries.set(id, {
-      handler,
-      index: this.handlers.length - 1,
     });
-    internals.handlersLength = this.handlers.length;
-
-    return id;
+    return this.handlers.length - 1;
   }
 
   /**
@@ -59905,28 +58861,8 @@ class InterceptorManager {
    * @returns {void}
    */
   eject(id) {
-    const internals = this[InterceptorManager_$internals];
-
-    syncHandlerEntries(this, internals);
-
-    const handlerId = normalizeHandlerId(id);
-    const entry = internals.handlerEntries.get(handlerId);
-
-    if (entry) {
-      internals.handlerEntries.delete(handlerId);
-
-      // Ignore IDs invalidated by clear or direct replacement of handlers.
-      if (this.handlers[entry.index] !== entry.handler) {
-        return;
-      }
-
-      this.handlers[entry.index] = null;
-
-      // Do not reuse an index while forEach is walking its length snapshot.
-      if (!internals.iterationDepth) {
-        trimHandlers(this.handlers);
-        internals.handlersLength = this.handlers.length;
-      }
+    if (this.handlers[id]) {
+      this.handlers[id] = null;
     }
   }
 
@@ -59938,7 +58874,6 @@ class InterceptorManager {
   clear() {
     if (this.handlers) {
       this.handlers = [];
-      syncHandlerEntries(this, this[InterceptorManager_$internals]);
     }
   }
 
@@ -59953,25 +58888,11 @@ class InterceptorManager {
    * @returns {void}
    */
   forEach(fn) {
-    const internals = this[InterceptorManager_$internals];
-
-    syncHandlerEntries(this, internals);
-
-    internals.iterationDepth++;
-
-    try {
-      utils.forEach(this.handlers, function forEachHandler(h) {
-        if (h !== null) {
-          fn(h);
-        }
-      });
-    } finally {
-      if (!--internals.iterationDepth) {
-        syncHandlerEntries(this, internals);
-        trimHandlers(this.handlers);
-        internals.handlersLength = countHandlers(this.handlers);
+    utils.forEach(this.handlers, function forEachHandler(h) {
+      if (h !== null) {
+        fn(h);
       }
-    }
+    });
   }
 }
 
@@ -59987,7 +58908,6 @@ class InterceptorManager {
   legacyInterceptorReqResOrdering: true,
   advertiseZstdAcceptEncoding: false,
   validateStatusUndefinedResolves: true,
-  encodeBasicAuthUsername: false,
 });
 
 // EXTERNAL MODULE: external "url"
@@ -60141,18 +59061,12 @@ function throwIfDepthExceeded(index) {
  * @returns An array of strings.
  */
 function parsePropPath(name) {
-  // foo[x][y][z] -> ['foo', 'x', 'y', 'z']
-  // foo.x.y.z    -> ['foo', 'x', 'y', 'z']
-  // A path is split on `.` and on `[...]` groups. A segment — whether written
-  // in dot notation or captured inside brackets — may contain any character
-  // except `.`, `[` and `]`, so a key like `user-name` or `user name` is kept
-  // literal instead of being split (#5402). `.`, `[` and `]` keep their existing
-  // meaning, e.g. `foo[bar.baz]` -> ['foo', 'bar', 'baz'] and `[]` is an array push.
-  // Excluding `[` from the bracket group also makes the match fail fast at the
-  // next `[`, so a malformed name cannot rescan to the end of the string from
-  // every unmatched `[` — parsing stays linear in the length of the name.
+  // foo[x][y][z]
+  // foo.x.y.z
+  // foo-x-y-z
+  // foo x y z
   const path = [];
-  const pattern = /[^.[\]]+|\[([^.[\]]*)]/g;
+  const pattern = /\w+|\[(\w*)]/g;
   let match;
 
   while ((match = pattern.exec(name)) !== null) {
@@ -60183,29 +59097,6 @@ function arrayToObject(arr) {
   return obj;
 }
 
-function normalizeArray(value) {
-  if (!utils.isArray(value)) return value;
-
-  const keys = Object.keys(value);
-  return keys.length !== value.length || keys.some((key, index) => key !== String(index))
-    ? arrayToObject(value)
-    : value;
-}
-
-function normalizeArrays(obj) {
-  const pending = [obj];
-  while (pending.length) {
-    const target = pending.pop();
-    Object.keys(target).forEach((key) => {
-      const value = (target[key] = normalizeArray(target[key]));
-      if (utils.isArray(value) || utils.isPlainObject(value)) {
-        pending.push(value);
-      }
-    });
-  }
-  return obj;
-}
-
 /**
  * It takes a FormData object and returns a JavaScript object
  *
@@ -60227,7 +59118,6 @@ function formDataToJSON(formData) {
 
     if (isLast) {
       if (utils.hasOwnProp(target, name)) {
-        target[name] = normalizeArray(target[name]);
         target[name] = utils.isArray(target[name])
           ? target[name].concat(value)
           : [target[name], value];
@@ -60258,7 +59148,7 @@ function formDataToJSON(formData) {
       buildPath(parsePropPath(name), value, obj, 0);
     });
 
-    return normalizeArrays(obj);
+    return obj;
   }
 
   return null;
@@ -60266,27 +59156,7 @@ function formDataToJSON(formData) {
 
 /* harmony default export */ const helpers_formDataToJSON = (formDataToJSON);
 
-;// CONCATENATED MODULE: ./node_modules/axios/lib/core/methodList.js
-
-
-const methodList = Object.freeze([
-  'get',
-  'delete',
-  'head',
-  'options',
-  'post',
-  'put',
-  'patch',
-  'purge',
-  'link',
-  'unlink',
-  'query',
-]);
-
-/* harmony default export */ const core_methodList = (methodList);
-
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/defaults/index.js
-
 
 
 
@@ -60309,7 +59179,7 @@ const own = (obj, key) => (obj != null && utils.hasOwnProp(obj, key) ? obj[key] 
  *
  * @returns {string} A stringified version of the rawValue.
  */
-function defaults_stringifySafely(rawValue, parser, encoder) {
+function stringifySafely(rawValue, parser, encoder) {
   if (utils.isString(rawValue)) {
     try {
       (parser || JSON.parse)(rawValue);
@@ -60388,7 +59258,7 @@ const defaults = {
 
       if (isObjectPayload || hasJSONContentType) {
         headers.setContentType('application/json', false);
-        return defaults_stringifySafely(data);
+        return stringifySafely(data);
       }
 
       return data;
@@ -60459,7 +59329,7 @@ const defaults = {
   },
 };
 
-utils.forEach(core_methodList, (method) => {
+utils.forEach(['delete', 'get', 'head', 'post', 'put', 'patch', 'query'], (method) => {
   defaults.headers[method] = {};
 });
 
@@ -60588,43 +59458,9 @@ function isAbsoluteURL(url) {
  * @returns {string} The combined URL
  */
 function combineURLs(baseURL, relativeURL) {
-  if (!relativeURL) {
-    return baseURL;
-  }
-
-  let end = baseURL.length;
-
-  while (end > 0 && baseURL.charCodeAt(end - 1) === 47) {
-    end--;
-  }
-
-  return baseURL.slice(0, end) + '/' + relativeURL.replace(/^\/+/, '');
-}
-
-;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/normalizeURLForProtocolCheck.js
-
-
-const urlParserControlCharacters = /[\t\n\r]/g;
-
-/**
- * Match WHATWG URL preprocessing before checking a URL's protocol.
- *
- * @param {string} url
- *
- * @returns {string}
- */
-function normalizeURLForProtocolCheck(url) {
-  if (typeof url !== 'string') {
-    return url;
-  }
-
-  let start = 0;
-
-  while (start < url.length && url.charCodeAt(start) <= 0x20) {
-    start++;
-  }
-
-  return url.slice(start).replace(urlParserControlCharacters, '');
+  return relativeURL
+    ? baseURL.replace(/\/?\/$/, '') + '/' + relativeURL.replace(/^\/+/, '')
+    : baseURL;
 }
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/core/buildFullPath.js
@@ -60634,54 +59470,28 @@ function normalizeURLForProtocolCheck(url) {
 
 
 
-
 const malformedHttpProtocol = /^https?:(?!\/\/)/i;
+const httpProtocolControlCharacters = /[\t\n\r]/g;
 
-// Redact the parts of a URL that can carry secrets before it is embedded in an
-// error message. AxiosError.toJSON() serializes `message` verbatim and errors
-// are commonly logged, while the opt-in `config.redact` model only cleans
-// config keys — it cannot reach the message. Redact only the genuinely
-// sensitive substrings — userinfo (credentials), query parameter values and
-// fragment contents — with the same REDACTED marker the config redaction uses,
-// while keeping the scheme, host, path and parameter names so the offending
-// request stays accurately identifiable.
-function redactFragment(fragment) {
-  if (!fragment) {
-    return fragment;
+function stripLeadingC0ControlOrSpace(url) {
+  let i = 0;
+  while (i < url.length && url.charCodeAt(i) <= 0x20) {
+    i++;
   }
-
-  return fragment.replace(/(^|&)([^=&]*=)?[^&]+/g, (match, separator, parameterName = '') => {
-    return `${separator}${parameterName}${REDACTED}`;
-  });
+  return url.slice(i);
 }
 
-function redactSensitiveURLParts(url) {
-  const redactedURL = url.replace(/^(https?:\/{0,2})[^/?#]*@/i, `$1${REDACTED}@`);
-  const fragmentIndex = redactedURL.indexOf('#');
-  const urlWithoutFragment =
-    fragmentIndex === -1 ? redactedURL : redactedURL.slice(0, fragmentIndex);
-  const redactedURLWithoutFragment = urlWithoutFragment.replace(
-    /([?&][^=&#]*=)[^&#]*/g,
-    `$1${REDACTED}`
-  );
-
-  if (fragmentIndex === -1) {
-    return redactedURLWithoutFragment;
-  }
-
-  return `${redactedURLWithoutFragment}#${redactFragment(redactedURL.slice(fragmentIndex + 1))}`;
+function normalizeURLForProtocolCheck(url) {
+  return stripLeadingC0ControlOrSpace(url).replace(httpProtocolControlCharacters, '');
 }
 
 function assertValidHttpProtocolURL(url, config) {
-  if (typeof url === 'string') {
-    const normalizedURL = normalizeURLForProtocolCheck(url);
-    if (malformedHttpProtocol.test(normalizedURL)) {
-      throw new core_AxiosError(
-        `Invalid URL ${JSON.stringify(redactSensitiveURLParts(normalizedURL))}: missing "//" after protocol`,
-        core_AxiosError.ERR_INVALID_URL,
-        config
-      );
-    }
+  if (typeof url === 'string' && malformedHttpProtocol.test(normalizeURLForProtocolCheck(url))) {
+    throw new core_AxiosError(
+      'Invalid URL: missing "//" after protocol',
+      core_AxiosError.ERR_INVALID_URL,
+      config
+    );
   }
 }
 
@@ -60821,13 +59631,13 @@ var follow_redirects = __nccwpck_require__(1573);
 ;// CONCATENATED MODULE: external "zlib"
 const external_zlib_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("zlib");
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/env/data.js
-const data_VERSION = "1.21.1";
+const data_VERSION = "1.18.1";
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/parseProtocol.js
 
 
 function parseProtocol(url) {
   const match = /^([-+\w]{1,25}):(?:\/\/)?/.exec(url);
-  return (match && match[1].toLowerCase()) || '';
+  return (match && match[1]) || '';
 }
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/fromDataURI.js
@@ -60839,10 +59649,7 @@ function parseProtocol(url) {
 
 // RFC 2397: data:[<mediatype>][;base64],<data>
 // mediatype = type/subtype followed by optional ;name=value parameters
-// The `i` flag makes the `;base64` token case-insensitive, matching the WHATWG
-// URL/Fetch data URL processor (and therefore the fetch adapter and browsers).
-// The remaining character classes do not depend on letter case.
-const DATA_URL_PATTERN = /^([^,;/]+\/[^,;/]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/i;
+const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
 
 /**
  * Parse data uri to a Buffer or Blob
@@ -60885,13 +59692,9 @@ function fromDataURI(uri, asBlob, options) {
       mime = 'text/plain' + params;
     }
 
-    const buffer =
-      encoding === 'base64'
-        ? Buffer.from(
-            body.replace(/%([\da-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
-            'base64'
-          )
-        : Buffer.from(decodeURIComponent(body), encoding);
+    const buffer = encoding === 'base64'
+      ? Buffer.from(body, 'base64')
+      : Buffer.from(decodeURIComponent(body), encoding);
 
     if (asBlob) {
       if (!_Blob) {
@@ -60909,35 +59712,6 @@ function fromDataURI(uri, asBlob, options) {
 
 // EXTERNAL MODULE: external "stream"
 var external_stream_ = __nccwpck_require__(2203);
-;// CONCATENATED MODULE: ./node_modules/axios/lib/core/setFormDataHeaders.js
-
-
-const FORM_DATA_CONTENT_HEADERS = ['content-type', 'content-length'];
-
-/**
- * Apply the headers generated by a FormData implementation to the request headers,
- * honoring the `formDataHeaderPolicy` option: with 'content-only', copy only the
- * content-* headers; otherwise merge all of them.
- *
- * @param {AxiosHeaders} headers - the request headers to mutate
- * @param {Object | null | undefined} formHeaders - headers produced by the FormData implementation
- * @param {String} [policy] - the resolved `formDataHeaderPolicy` config value
- *
- * @returns {void}
- */
-function setFormDataHeaders(headers, formHeaders, policy) {
-  if (policy !== 'content-only') {
-    headers.set(formHeaders);
-    return;
-  }
-
-  Object.entries(formHeaders || {}).forEach(([key, val]) => {
-    if (FORM_DATA_CONTENT_HEADERS.includes(key.toLowerCase())) {
-      headers.set(key, val);
-    }
-  });
-}
-
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/AxiosTransformStream.js
 
 
@@ -61010,14 +59784,10 @@ class AxiosTransformStream extends external_stream_.Transform {
 
     const divider = 1000 / timeWindow;
     const bytesThreshold = maxRate / divider;
-    let minChunkSize =
+    const minChunkSize =
       internals.minChunkSize !== false
         ? Math.max(internals.minChunkSize, bytesThreshold * 0.01)
         : 0;
-
-    if (maxRate) {
-      minChunkSize = Math.min(bytesThreshold, minChunkSize);
-    }
 
     const pushChunk = (_chunk, _callback) => {
       const bytes = Buffer.byteLength(_chunk);
@@ -61037,9 +59807,6 @@ class AxiosTransformStream extends external_stream_.Transform {
     };
 
     const transformChunk = (_chunk, _callback) => {
-      if (this.destroyed) {
-        return _callback();
-      }
       const chunkSize = Buffer.byteLength(_chunk);
       let chunkRemainder = null;
       let maxChunkSize = readableHighWaterMark;
@@ -61068,9 +59835,7 @@ class AxiosTransformStream extends external_stream_.Transform {
         }
 
         if (bytesLeft < maxChunkSize) {
-          // A buffer boundary must consume at least one byte. Carry any
-          // fractional allowance forward in the next accounting window.
-          maxChunkSize = Math.max(1, Math.floor(bytesLeft));
+          maxChunkSize = bytesLeft;
         }
       }
 
@@ -61292,7 +60057,6 @@ class Http2Sessions {
 
   getSession(authority, options) {
     options = Object.assign(
-      Object.create(null),
       {
         sessionTimeout: 1000,
       },
@@ -61370,7 +60134,7 @@ class Http2Sessions {
         }
 
         stream.once('close', () => {
-          if (!--streamsCount && !removed) {
+          if (!--streamsCount) {
             timer = setTimeout(() => {
               timer = null;
               removeSession();
@@ -61383,8 +60147,6 @@ class Http2Sessions {
     }
 
     session.once('close', removeSession);
-    session.once('error', removeSession);
-    session.once('goaway', removeSession);
 
     let entry = [session, options];
 
@@ -61419,131 +60181,13 @@ const callbackify = (fn, reducer) => {
 /* harmony default export */ const helpers_callbackify = (callbackify);
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/shouldBypassProxy.js
-
-
 const LOOPBACK_HOSTNAMES = new Set(['localhost', '0.0.0.0']);
-
-const trimTrailingDots = (value) => {
-  let end = value.length;
-
-  while (end && value.charCodeAt(end - 1) === 46) {
-    end--;
-  }
-
-  return end === value.length ? value : value.slice(0, end);
-};
 
 const isIPv4Loopback = (host) => {
   const parts = host.split('.');
   if (parts.length !== 4) return false;
   if (parts[0] !== '127') return false;
   return parts.every((p) => /^\d+$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
-};
-
-/**
- * Canonicalize an IPv4 address written in shorthand, octal, or hex form into
- * dotted-decimal. IPv6 addresses and non-IP strings are returned unchanged so
- * the existing IPv4-mapped IPv6 unmap path and the isLoopback path can still
- * see them.
- *
- * Shorthand expansion mirrors Node's URL parser: literal parts fill from the
- * left, the final part fills the remaining octets from the right with
- * zero-padding on the left.
- *   127.1     -> 127.0.0.1
- *   127.0.1   -> 127.0.0.1
- *   1.2.3     -> 1.2.0.3
- *
- * Each octet is parsed with an explicit base: 16 for `0x`/`0X` prefix, 8 for
- * zero-prefixed multi-digit all-`0-7` parts, 10 otherwise. Zero-prefixed
- * decimal-looking parts that contain `8` or `9` are rejected to match Node's
- * URL parser, and the comparison layer falls through to non-bypass if either
- * side rejects the form (fail-safe).
- *
- * Returns the input unchanged on any parse failure, out-of-range octet, or
- * unusual shape (1-part, 5+ parts) so the comparison layer fails closed.
- */
-const parseIPv4Octet = (text) => {
-  if (/^0[xX][0-9a-fA-F]+$/.test(text)) {
-    const n = parseInt(text.slice(2), 16);
-    return Number.isFinite(n) ? n : null;
-  }
-  if (text.length > 1 && /^0[0-7]+$/.test(text)) {
-    const n = parseInt(text, 8);
-    return Number.isFinite(n) ? n : null;
-  }
-  if (text.length > 1 && /^0[0-9]+$/.test(text)) {
-    return null;
-  }
-  if (/^[0-9]+$/.test(text)) {
-    const n = parseInt(text, 10);
-    return Number.isFinite(n) ? n : null;
-  }
-  return null;
-};
-
-const normalizeIPAddress = (host) => {
-  if (typeof host !== 'string' || !host || host.indexOf(':') !== -1) {
-    return host;
-  }
-
-  let h = host;
-  if (h.charAt(0) === '[' && h.charAt(h.length - 1) === ']') {
-    h = h.slice(1, -1);
-  }
-  h = trimTrailingDots(h);
-
-  // Allowed characters for any IPv4 shape: digits, dot, 'x', 'X', hex digits.
-  if (!/^[0-9.xXa-fA-F]+$/.test(h)) return host;
-
-  const parts = h.split('.');
-
-  // No part may be empty (e.g. "127..0.1" or "127.0.0."). Trailing dots are
-  // already stripped above; this guards against the empty-middle case.
-  if (parts.some((p) => p === '')) return host;
-
-  if (parts.length === 4) {
-    // Full IPv4 form: each part is an octet.
-    const octets = parts.map(parseIPv4Octet);
-    if (octets.some((n) => n === null || n < 0 || n > 255)) return host;
-    return octets.join('.');
-  }
-
-  if (parts.length > 4) {
-    return host;
-  }
-
-  // Shorthand: 1..3 parts. Node's URL parser treats a 1-part input as a 32-bit
-  // integer split into octets, which has surprising semantics (e.g. "127" ->
-  // "0.0.0.127"). Reject 1-part inputs to keep the helper predictable: the
-  // fail-safe returns the input unchanged and the comparison layer falls
-  // through to non-bypass.
-  if (parts.length === 1) return host;
-
-  // 2..3 parts: literal parts fill from the left, tail fills remaining octets
-  // from the right with zero-padding.
-  const literalOctets = parts.slice(0, -1);
-  const tail = parts[parts.length - 1];
-  const tailSlots = 4 - literalOctets.length;
-
-  // Tail is parsed as a full IPv4 number (hex/octal/decimal) and packed
-  // low-byte-right into the remaining octets, matching Node's URL parser.
-  // e.g. 127.65535 (tail 0xFFFF into 3 slots) -> 127.0.255.255;
-  //      127.0x00ff (tail 0xFF into 3 slots) -> 127.0.0.255;
-  //      127.0.65535 (tail 0xFFFF into 2 slots) -> 127.0.255.255.
-  const tailValue = parseIPv4Octet(tail);
-  if (tailValue === null) return host;
-  const maxTail = (1 << (8 * tailSlots)) - 1;
-  if (tailValue < 0 || tailValue > maxTail) return host;
-
-  const tailOctets = new Array(tailSlots).fill(0);
-  for (let i = tailSlots - 1, v = tailValue; i >= 0; i--, v >>= 8) {
-    tailOctets[i] = v & 0xff;
-  }
-
-  const literal = literalOctets.map(parseIPv4Octet);
-  if (literal.some((n) => n === null || n < 0 || n > 255)) return host;
-
-  return [...literal, ...tailOctets].join('.');
 };
 
 const isIPv6ZeroGroup = (group) => /^0{1,4}$/.test(group);
@@ -61567,7 +60211,9 @@ const isIPv6Unspecified = (host) => {
     const explicitGroups = leftGroups.length + rightGroups.length;
 
     return (
-      explicitGroups < 8 && leftGroups.every(isIPv6ZeroGroup) && rightGroups.every(isIPv6ZeroGroup)
+      explicitGroups < 8 &&
+      leftGroups.every(isIPv6ZeroGroup) &&
+      rightGroups.every(isIPv6ZeroGroup)
     );
   }
 
@@ -61663,8 +60309,7 @@ const parseNoProxyEntry = (entry) => {
 // allowing the proxy-bypass policy to be circumvented by using the alternate
 // representation. Returns the input unchanged when not IPv4-mapped.
 const IPV4_MAPPED_DOTTED_RE = /^(?:::|(?:0{1,4}:){1,4}:|(?:0{1,4}:){5})ffff:(\d+\.\d+\.\d+\.\d+)$/i;
-const IPV4_MAPPED_HEX_RE =
-  /^(?:::|(?:0{1,4}:){1,4}:|(?:0{1,4}:){5})ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
+const IPV4_MAPPED_HEX_RE = /^(?:::|(?:0{1,4}:){1,4}:|(?:0{1,4}:){5})ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
 
 const unmapIPv4MappedIPv6 = (host) => {
   if (typeof host !== 'string' || host.indexOf(':') === -1) return host;
@@ -61682,57 +60327,6 @@ const unmapIPv4MappedIPv6 = (host) => {
   return host;
 };
 
-const IPV4_OCTET_RE = /^(?:0|[1-9]\d{0,2})$/;
-
-const ipv4ToBytes = (host) => {
-  const parts = host.split('.');
-
-  return parts.length === 4 &&
-    parts.every((part) => IPV4_OCTET_RE.test(part) && Number(part) <= 255)
-    ? parts.map(Number)
-    : null;
-};
-
-const IPV6_GROUP_RE = /^[0-9a-f]{1,4}$/i;
-
-const ipv6ToBytes = (host) => {
-  const halves = host.split('::');
-
-  if (halves.length > 2) {
-    return null;
-  }
-
-  const groups = halves[0] ? halves[0].split(':') : [];
-
-  if (halves.length === 2) {
-    const rear = halves[1] ? halves[1].split(':') : [];
-    const missing = 8 - groups.length - rear.length;
-
-    if (missing < 1) {
-      return null;
-    }
-
-    groups.push(...new Array(missing).fill('0'), ...rear);
-  }
-
-  if (groups.length !== 8 || groups.some((group) => !IPV6_GROUP_RE.test(group))) {
-    return null;
-  }
-
-  return groups.flatMap((group) => {
-    const value = Number.parseInt(group, 16);
-    return [(value >> 8) & 0xff, value & 0xff];
-  });
-};
-
-const ipToBytes = (host) => {
-  if (typeof host !== 'string' || !host) {
-    return null;
-  }
-
-  return host.indexOf(':') !== -1 ? ipv6ToBytes(host) : ipv4ToBytes(host);
-};
-
 const normalizeNoProxyHost = (hostname) => {
   if (!hostname) {
     return hostname;
@@ -61742,133 +60336,7 @@ const normalizeNoProxyHost = (hostname) => {
     hostname = hostname.slice(1, -1);
   }
 
-  let trimmed = trimTrailingDots(hostname);
-  if (trimmed.indexOf(':') !== -1) {
-    try {
-      trimmed = new URL('http://[' + trimmed + ']/').hostname.slice(1, -1);
-    } catch (_err) {
-      return trimmed;
-    }
-  } else if (/[\u0080-\uffff]/.test(trimmed)) {
-    const prefix = /^[*.]+/.exec(trimmed);
-    const start = prefix ? prefix[0] : '';
-    const ascii = (0,external_url_.domainToASCII)(trimmed.slice(start.length));
-    if (!ascii) return '';
-    trimmed = start + trimTrailingDots(ascii);
-  }
-
-  // IPv4 shorthand/octal/hex → dotted-decimal; helper is a no-op for inputs
-  // containing ':' (IPv6 and IPv4-mapped IPv6) so we fall through to unmap.
-  const ipv4 = normalizeIPAddress(trimmed);
-  if (ipv4 !== trimmed) {
-    return ipv4;
-  }
-
-  return unmapIPv4MappedIPv6(trimmed);
-};
-
-const normalizeCidrBase = (input) => {
-  let base = input;
-  const startsBracket = base.charAt(0) === '[';
-  const endsBracket = base.charAt(base.length - 1) === ']';
-  const hasBracket = base.includes('[') || base.includes(']');
-
-  if (startsBracket || endsBracket) {
-    if (!startsBracket || !endsBracket) {
-      return null;
-    }
-
-    base = base.slice(1, -1);
-
-    if (base.indexOf(':') === -1 || base.includes('[') || base.includes(']')) {
-      return null;
-    }
-  } else if (hasBracket) {
-    return null;
-  }
-
-  if (!base || base.charAt(base.length - 1) === '.') {
-    return null;
-  }
-
-  const wasIPv6 = base.indexOf(':') !== -1;
-
-  if (wasIPv6) {
-    try {
-      base = new URL(`http://[${base}]/`).hostname.slice(1, -1);
-    } catch (_err) {
-      return null;
-    }
-  } else {
-    base = normalizeIPAddress(base);
-
-    if (!ipv4ToBytes(base)) {
-      return null;
-    }
-  }
-
-  return { normalized: unmapIPv4MappedIPv6(base), wasIPv6 };
-};
-
-const CIDR_ENTRY_RE = /^(.+)\/(0|[1-9]\d{0,2})$/;
-
-const parseCidrEntry = (entry) => {
-  if (entry.indexOf('/') === -1) {
-    return undefined;
-  }
-
-  const match = CIDR_ENTRY_RE.exec(entry);
-
-  if (!match) {
-    return null;
-  }
-
-  let prefix = Number(match[2]);
-  const parsedBase = normalizeCidrBase(match[1]);
-
-  if (!parsedBase) {
-    return null;
-  }
-
-  const { normalized, wasIPv6 } = parsedBase;
-
-  if (wasIPv6 && normalized.indexOf(':') === -1) {
-    if (prefix < 96) {
-      return null;
-    }
-
-    prefix -= 96;
-  }
-
-  const bytes = ipToBytes(normalized);
-
-  if (!bytes || prefix > bytes.length * 8) {
-    return null;
-  }
-
-  return { bytes, prefix };
-};
-
-const isInSubnet = (addressBytes, networkBytes, prefix) => {
-  const fullBytes = prefix >> 3;
-
-  for (let i = 0; i < fullBytes; i++) {
-    if (addressBytes[i] !== networkBytes[i]) {
-      return false;
-    }
-  }
-
-  const remainingBits = prefix & 7;
-
-  if (remainingBits) {
-    const mask = (0xff << (8 - remainingBits)) & 0xff;
-
-    if ((addressBytes[fullBytes] & mask) !== (networkBytes[fullBytes] & mask)) {
-      return false;
-    }
-  }
-
-  return true;
+  return unmapIPv4MappedIPv6(hostname.replace(/\.+$/, ''));
 };
 
 function shouldBypassProxy(location) {
@@ -61894,26 +60362,10 @@ function shouldBypassProxy(location) {
     Number.parseInt(parsed.port, 10) || shouldBypassProxy_DEFAULT_PORTS[parsed.protocol.split(':', 1)[0]] || 0;
 
   const hostname = normalizeNoProxyHost(parsed.hostname.toLowerCase());
-  const hostnameBytes = ipToBytes(hostname);
 
   return noProxy.split(/[\s,]+/).some((entry) => {
     if (!entry) {
       return false;
-    }
-
-    if (entry === '*') {
-      return true;
-    }
-
-    const cidr = parseCidrEntry(entry);
-
-    if (cidr !== undefined) {
-      return (
-        cidr !== null &&
-        !!hostnameBytes &&
-        hostnameBytes.length === cidr.bytes.length &&
-        isInSubnet(hostnameBytes, cidr.bytes, cidr.prefix)
-      );
     }
 
     let [entryHost, entryPort] = parseNoProxyEntry(entry);
@@ -62002,7 +60454,7 @@ function speedometer(samplesCount, min) {
  * Throttle decorator
  * @param {Function} fn
  * @param {Number} freq
- * @return {Array<Function>}
+ * @return {Function}
  */
 function throttle(fn, freq) {
   let timestamp = 0;
@@ -62037,9 +60489,8 @@ function throttle(fn, freq) {
   };
 
   const flush = () => lastArgs && invoke(lastArgs);
-  const flushWith = (...args) => invoke(args);
 
-  return [throttled, flush, flushWith];
+  return [throttled, flush];
 }
 
 /* harmony default export */ const helpers_throttle = (throttle);
@@ -62054,12 +60505,12 @@ const progressEventReducer = (listener, isDownloadStream, freq = 3) => {
   const _speedometer = helpers_speedometer(50, 250);
 
   return helpers_throttle((e) => {
-    if (!e || !utils.isNumber(e.loaded)) {
+    if (!e || typeof e.loaded !== 'number') {
       return;
     }
     const rawLoaded = e.loaded;
     const total = e.lengthComputable ? e.total : undefined;
-    const loaded = Math.max(0, total != null ? Math.min(rawLoaded, total) : rawLoaded);
+    const loaded = total != null ? Math.min(rawLoaded, total) : rawLoaded;
     const progressBytes = Math.max(0, loaded - bytesNotified);
     const rate = _speedometer(progressBytes);
 
@@ -62096,17 +60547,19 @@ const progressEventDecorator = (total, throttled) => {
 };
 
 const asyncDecorator =
-  (fn, scheduler = utils.asap) =>
+  (fn) =>
   (...args) =>
-    scheduler(() => fn(...args));
+    utils.asap(() => fn(...args));
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/estimateDataURLDecodedBytes.js
 /**
- * Estimate data: URL byte lengths *without* allocating large buffers.
- * - Fetch percent-decodes a base64 body before decoding it.
- * - Node's Buffer.from(body, 'base64') sizes its backing allocation from the
- *   percent-decoded body, including ignored characters and content after padding.
- * - Non-base64 data is percent-decoded and then encoded as UTF-8.
+ * Estimate decoded byte length of a data:// URL *without* allocating large buffers.
+ * - For base64: compute exact decoded size using length and padding;
+ *               handle %XX at the character-count level (no string allocation).
+ * - For non-base64: compute the exact percent-decoded UTF-8 byte length.
+ *
+ * @param {string} url
+ * @returns {number}
  */
 const isHexDigit = (charCode) =>
   (charCode >= 48 && charCode <= 57) ||
@@ -62116,126 +60569,64 @@ const isHexDigit = (charCode) =>
 const isPercentEncodedByte = (str, i, len) =>
   i + 2 < len && isHexDigit(str.charCodeAt(i + 1)) && isHexDigit(str.charCodeAt(i + 2));
 
-const hexValue = (charCode) => (charCode <= 57 ? charCode - 48 : (charCode & 0xdf) - 55);
-
-const isBase64Char = (charCode) =>
-  (charCode >= 65 && charCode <= 90) || // A-Z
-  (charCode >= 97 && charCode <= 122) || // a-z
-  (charCode >= 48 && charCode <= 57) || // 0-9
-  charCode === 43 || // +
-  charCode === 47 || // /
-  charCode === 45 || // - (base64url)
-  charCode === 95; // _ (base64url)
-
-const isBase64Whitespace = (charCode) =>
-  charCode === 9 || charCode === 10 || charCode === 12 || charCode === 13 || charCode === 32;
-
-const base64Bytes = (significant) => {
-  const groups = Math.floor(significant / 4);
-  const remainder = significant % 4;
-  return groups * 3 + (remainder === 2 ? 1 : remainder === 3 ? 2 : 0);
-};
-
-// Buffer.byteLength(body, 'base64') uses the raw string length as an allocation
-// upper bound even when Buffer.from later ignores characters or stops at '='.
-const estimateBase64BufferAllocation = (body) => {
-  const len = body.length;
-  let padding = 0;
-
-  if (len > 0 && body.charCodeAt(len - 1) === 61 /* '=' */) {
-    padding++;
-
-    if (len > 1 && body.charCodeAt(len - 2) === 61 /* '=' */) {
-      padding++;
-    }
-  }
-
-  return Math.floor(((len - padding) * 3) / 4);
-};
-
-const estimatePercentDecodedBase64BufferAllocation = (body) => {
-  // Ordinary Base64 needs only its length and trailing padding.
-  if (body.indexOf('%') === -1) {
-    return estimateBase64BufferAllocation(body);
-  }
-
-  let length = 0;
-  let previous = 0;
-  let last = 0;
-
-  for (let i = 0, len = body.length; i < len; i++) {
-    let code = body.charCodeAt(i);
-    if (code === 37 /* '%' */ && isPercentEncodedByte(body, i, len)) {
-      code = hexValue(body.charCodeAt(i + 1)) * 16 + hexValue(body.charCodeAt(i + 2));
-      i += 2;
-    }
-    length++;
-    previous = last;
-    last = code;
-  }
-
-  const padding = last === 61 ? (previous === 61 ? 2 : 1) : 0;
-  return Math.floor(((length - padding) * 3) / 4);
-};
-
-const estimatePercentDecodedBase64Bytes = (body) => {
-  const len = body.length;
-  let significant = 0;
-  let padding = 0;
-  let invalid = false;
-
-  for (let i = 0; i < len; i++) {
-    let code = body.charCodeAt(i);
-
-    if (code === 37 /* '%' */ && isPercentEncodedByte(body, i, len)) {
-      code = hexValue(body.charCodeAt(i + 1)) * 16 + hexValue(body.charCodeAt(i + 2));
-      i += 2;
-    }
-
-    if (isBase64Whitespace(code)) {
-      continue;
-    }
-
-    if (code === 61 /* '=' */) {
-      padding++;
-      continue;
-    }
-
-    if (!isBase64Char(code) || padding > 0) {
-      invalid = true;
-      continue;
-    }
-
-    significant++;
-  }
-
-  // Fetch rejects malformed forgiving-base64 input. Returning the raw-size
-  // allocation bound keeps that invalid input from becoming a pre-check bypass.
-  if (
-    invalid ||
-    padding > 2 ||
-    (padding > 0 && (significant + padding) % 4 !== 0) ||
-    significant % 4 === 1
-  ) {
-    return estimateBase64BufferAllocation(body);
-  }
-
-  return base64Bytes(significant);
-};
-
-const estimateDataURLBytes = (url, estimateBase64, base64Pattern) => {
+function estimateDataURLDecodedBytes(url) {
   if (!url || typeof url !== 'string') return 0;
-  if (!/^data:/i.test(url)) return 0;
+  if (!url.startsWith('data:')) return 0;
 
   const comma = url.indexOf(',');
   if (comma < 0) return 0;
 
   const meta = url.slice(5, comma);
   const body = url.slice(comma + 1);
-  const isBase64 = base64Pattern.test(meta);
+  const isBase64 = /;base64/i.test(meta);
 
   if (isBase64) {
-    return estimateBase64(body);
+    let effectiveLen = body.length;
+    const len = body.length; // cache length
+
+    for (let i = 0; i < len; i++) {
+      if (body.charCodeAt(i) === 37 /* '%' */ && i + 2 < len) {
+        const a = body.charCodeAt(i + 1);
+        const b = body.charCodeAt(i + 2);
+        const isHex = isHexDigit(a) && isHexDigit(b);
+
+        if (isHex) {
+          effectiveLen -= 2;
+          i += 2;
+        }
+      }
+    }
+
+    let pad = 0;
+    let idx = len - 1;
+
+    const tailIsPct3D = (j) =>
+      j >= 2 &&
+      body.charCodeAt(j - 2) === 37 && // '%'
+      body.charCodeAt(j - 1) === 51 && // '3'
+      (body.charCodeAt(j) === 68 || body.charCodeAt(j) === 100); // 'D' or 'd'
+
+    if (idx >= 0) {
+      if (body.charCodeAt(idx) === 61 /* '=' */) {
+        pad++;
+        idx--;
+      } else if (tailIsPct3D(idx)) {
+        pad++;
+        idx -= 3;
+      }
+    }
+
+    if (pad === 1 && idx >= 0) {
+      if (body.charCodeAt(idx) === 61 /* '=' */) {
+        pad++;
+      } else if (tailIsPct3D(idx)) {
+        pad++;
+      }
+    }
+
+    const groups = Math.floor(effectiveLen / 4);
+    const bytes = groups * 3 - (pad || 0);
+    return bytes > 0 ? bytes : 0;
   }
 
   // Compute UTF-8 byte length directly from UTF-16 code units without allocating
@@ -62265,39 +60656,9 @@ const estimateDataURLBytes = (url, estimateBase64, base64Pattern) => {
     }
   }
   return bytes;
-};
-
-/**
- * Estimate the percent-decoded payload size used by Fetch data: URLs.
- *
- * @param {string} url
- * @returns {number}
- */
-function estimateDataURLDecodedBytes(url) {
-  // Fetch removes URL fragments before processing a data: URL.
-  const fragmentIndex = typeof url === 'string' ? url.indexOf('#') : -1;
-
-  return estimateDataURLBytes(
-    fragmentIndex === -1 ? url : url.slice(0, fragmentIndex),
-    estimatePercentDecodedBase64Bytes,
-    /; *base64[\t\n\f\r ]*$/i
-  );
-}
-
-/**
- * Estimate the Buffer backing allocation used after Node's percent-decoding step.
- *
- * @param {string} url
- * @returns {number}
- */
-function estimateDataURLBufferAllocation(url) {
-  // Match fromDataURI's case-insensitive protocol and encoding suffix.
-  return estimateDataURLBytes(url, estimatePercentDecodedBase64BufferAllocation, /;base64$/i);
 }
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/adapters/http.js
-
-
 
 
 
@@ -62350,26 +60711,29 @@ const isBrotliSupported = utils.isFunction(external_zlib_namespaceObject.createB
 const isZstdSupported = utils.isFunction(external_zlib_namespaceObject.createZstdDecompress);
 const ACCEPT_ENCODING = 'gzip, compress, deflate' + (isBrotliSupported ? ', br' : '');
 const ACCEPT_ENCODING_WITH_ZSTD = ACCEPT_ENCODING + (isZstdSupported ? ', zstd' : '');
-const scheduleProgress =
-  typeof process !== 'undefined' && process.nextTick ? process.nextTick.bind(process) : utils.asap;
 
 const { http: httpFollow, https: httpsFollow } = follow_redirects;
 
 const http_isHttps = /https:?/;
+const FORM_DATA_CONTENT_HEADERS = ['content-type', 'content-length'];
+
+function setFormDataHeaders(headers, formHeaders, policy) {
+  if (policy !== 'content-only') {
+    headers.set(formHeaders);
+    return;
+  }
+
+  Object.entries(formHeaders).forEach(([key, val]) => {
+    if (FORM_DATA_CONTENT_HEADERS.includes(key.toLowerCase())) {
+      headers.set(key, val);
+    }
+  });
+}
 
 // Symbols used to bind a single 'error' listener to a pooled socket and track
 // the request currently owning that socket across keep-alive reuse (issue #10780).
 const kAxiosSocketListener = Symbol('axios.http.socketListener');
 const kAxiosCurrentReq = Symbol('axios.http.currentReq');
-
-// A shared listener avoids retaining an adapter context for the lifetime of a
-// pooled socket. EventEmitter invokes listeners with `this` set to the emitter.
-function handleSocketError(err) {
-  const current = this[kAxiosCurrentReq];
-  if (current && !current.destroyed) {
-    current.destroy(err);
-  }
-}
 
 // Tags HttpsProxyAgent instances installed by setProxy() so the redirect path
 // can strip them without clobbering a user-supplied agent that happens to be
@@ -62382,18 +60746,6 @@ const kAxiosInstalledTunnel = Symbol('axios.http.installedTunnel');
 // so unbounded growth is not a concern in practice.
 const tunnelingAgentCache = new Map();
 const tunnelingAgentCacheUser = new WeakMap();
-const directAgents = new WeakMap();
-const directAgentHooks = ['createConnection', 'getName'];
-const nativeAgentPoolHooks = [
-  'addRequest',
-  'createSocket',
-  'removeSocket',
-  'keepSocketAlive',
-  'reuseSocket',
-  '_getSession',
-  '_cacheSession',
-  '_evictSession',
-];
 // Minimum minor versions where Node's HTTP Agent supports native proxyEnv
 // handling. Checking the selected agent below also covers startup modes such
 // as NODE_OPTIONS=--use-env-proxy and --no-use-env-proxy precedence.
@@ -62430,91 +60782,16 @@ function isNodeEnvProxyEnabled(agent, nodeVersion = process.versions && process.
   const agentOptions = agent && agent.options;
 
   return Boolean(
-    agentOptions && utils.hasOwnProp(agentOptions, 'proxyEnv') && agentOptions.proxyEnv != null
+    agentOptions &&
+      utils.hasOwnProp(agentOptions, 'proxyEnv') &&
+      agentOptions.proxyEnv != null
   );
 }
 
 function getProxyEnvAgent(options, configHttpAgent, configHttpsAgent) {
   return http_isHttps.test(options.protocol)
-    ? configHttpsAgent || external_https_.globalAgent
-    : configHttpAgent || external_http_.globalAgent;
-}
-
-function getDirectAgent(configuredAgent, transport) {
-  if (
-    !process.allowedNodeEnvironmentFlags ||
-    !process.allowedNodeEnvironmentFlags.has('--use-env-proxy')
-  ) {
-    return configuredAgent;
-  }
-
-  const agent = configuredAgent || transport.globalAgent;
-  const options = agent && agent.options;
-  if (
-    !(agent instanceof transport.Agent) ||
-    agent.protocol !== transport.globalAgent.protocol ||
-    !options ||
-    !utils.hasOwnProp(options, 'proxyEnv') ||
-    typeof options.proxyEnv !== 'object' ||
-    options.proxyEnv === null
-  ) {
-    return configuredAgent;
-  }
-
-  // These hooks own pool queues or TLS session state. Neither binding them to
-  // the source agent nor copying them without subclass state preserves their
-  // behavior on a separate direct pool.
-  for (const hook of nativeAgentPoolHooks) {
-    if (
-      utils.isFunction(transport.Agent.prototype[hook]) &&
-      agent[hook] !== transport.Agent.prototype[hook]
-    ) {
-      throw new core_AxiosError(
-        'proxy: false cannot adapt an agent overriding ' +
-          hook +
-          '; use an agent constructed without proxyEnv',
-        core_AxiosError.ERR_BAD_OPTION_VALUE
-      );
-    }
-  }
-
-  // Node snapshots proxyEnv when constructing the agent. Keep this check
-  // conservative even when the caller later removes protocol-specific entries.
-  let direct = directAgents.get(agent);
-  if (!direct) {
-    direct = new transport.Agent({ ...options, proxyEnv: undefined });
-
-    // Agent.destroy() does not emit an event. Keep the associated pool under
-    // the configured agent's lifetime, including agents reused after destroy().
-    const destroy = agent.destroy;
-    agent.destroy = function destroyWithDirectAgent() {
-      try {
-        return destroy.apply(this, arguments);
-      } finally {
-        direct.destroy();
-      }
-    };
-    directAgents.set(agent, direct);
-  }
-
-  // Connections and pool keys do not own the direct pool's queues. Preserve
-  // their configured receiver and refresh hooks that change between requests.
-  for (const hook of directAgentHooks) {
-    direct[hook] =
-      agent[hook] === transport.Agent.prototype[hook]
-        ? transport.Agent.prototype[hook]
-        : bind_bind(agent[hook], agent);
-  }
-  return direct;
-}
-
-function setDirectAgent(options, configHttpAgent, configHttpsAgent) {
-  const secure = http_isHttps.test(options.protocol);
-  const agent = getDirectAgent(secure ? configHttpsAgent : configHttpAgent, secure ? external_https_ : external_http_);
-  options.agent = agent;
-  if (options.agents) {
-    options.agents[secure ? 'https' : 'http'] = agent;
-  }
+    ? (configHttpsAgent || external_https_.globalAgent)
+    : (configHttpAgent || external_http_.globalAgent);
 }
 
 function getTunnelingAgent(agentOptions, userHttpsAgent) {
@@ -62527,29 +60804,26 @@ function getTunnelingAgent(agentOptions, userHttpsAgent) {
     '#' +
     (agentOptions.auth || '');
   const cache = userHttpsAgent
-    ? tunnelingAgentCacheUser.get(userHttpsAgent) ||
-      tunnelingAgentCacheUser.set(userHttpsAgent, new Map()).get(userHttpsAgent)
+    ? (tunnelingAgentCacheUser.get(userHttpsAgent) ||
+        tunnelingAgentCacheUser.set(userHttpsAgent, new Map()).get(userHttpsAgent))
     : tunnelingAgentCache;
   let agent = cache.get(key);
   if (agent) return agent;
-  // Preserve per-request TLS options for the proxy connection, with our proxy
-  // fields taking precedence. Global-agent options belong only to the origin
-  // TLS upgrade in the callback below.
-  const merged =
-    userHttpsAgent && userHttpsAgent.options
-      ? { ...userHttpsAgent.options, ...agentOptions }
-      : agentOptions;
+  // Forward the user's TLS options (custom CA, rejectUnauthorized, client cert,
+  // etc.) into the tunneling agent so they apply to the origin TLS upgrade
+  // performed after CONNECT. Our proxy fields take precedence on conflict.
+  const merged = userHttpsAgent && userHttpsAgent.options
+    ? { ...userHttpsAgent.options, ...agentOptions }
+    : agentOptions;
   agent = new https_proxy_agent_dist(merged);
-  const callback = agent.callback;
-  agent.callback = function axiosTunnelingAgentCallback(req, opts) {
-    // Without a proxy the origin TLS connection would be made by https.globalAgent,
-    // so its options have to reach the tunneled origin too. Resolved per request
-    // because the tunneling agent outlives any one of them.
-    const originTLSAgent = userHttpsAgent || external_https_.globalAgent;
-    const originTLSOptions = originTLSAgent && originTLSAgent.options;
-    // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
-    return callback.call(this, req, { ...originTLSOptions, ...opts });
-  };
+  if (userHttpsAgent && userHttpsAgent.options) {
+    const originTLSOptions = { ...userHttpsAgent.options };
+    const callback = agent.callback;
+    agent.callback = function axiosTunnelingAgentCallback(req, opts) {
+      // HttpsProxyAgent v5 reads callback opts for the post-CONNECT origin TLS upgrade.
+      return callback.call(this, req, { ...originTLSOptions, ...opts });
+    };
+  }
   agent[kAxiosInstalledTunnel] = true;
   cache.set(key, agent);
   return agent;
@@ -62592,10 +60866,6 @@ const http2Sessions = new helpers_Http2Sessions();
  * @returns {Object<string, any>}
  */
 function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
-  if (!isSameOriginRedirect(options, requestDetails)) {
-    stripMatchingHeaders(options.headers, new Set(['authorization', 'cookie']));
-    delete options.auth;
-  }
   if (options.beforeRedirects.proxy) {
     options.beforeRedirects.proxy(options);
   }
@@ -62604,9 +60874,6 @@ function dispatchBeforeRedirect(options, responseDetails, requestDetails) {
   }
   if (options.beforeRedirects.sensitiveHeaders) {
     options.beforeRedirects.sensitiveHeaders(options, requestDetails);
-  }
-  if (options.beforeRedirects.direct) {
-    options.beforeRedirects.direct(options);
   }
   if (options.beforeRedirects.config) {
     options.beforeRedirects.config(options, responseDetails, requestDetails);
@@ -62644,22 +60911,13 @@ function isSameOriginRedirect(redirectOptions, requestDetails) {
  * @param {http.ClientRequestArgs} options
  * @param {AxiosProxyConfig} configProxy configuration from Axios options object
  * @param {string} location
- * @param {boolean} [allowEnvProxy=true] whether environment proxy configuration can be used
  *
- * @returns {boolean} whether a proxy applies to the selected transport
+ * @returns {http.ClientRequestArgs}
  */
-function setProxy(
-  options,
-  configProxy,
-  location,
-  isRedirect,
-  configHttpsAgent,
-  configHttpAgent,
-  allowEnvProxy = true
-) {
+function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, configHttpAgent) {
   let proxy = configProxy;
   const proxyEnvAgent = getProxyEnvAgent(options, configHttpAgent, configHttpsAgent);
-  if (!proxy && proxy !== false && allowEnvProxy && !isNodeEnvProxyEnabled(proxyEnvAgent)) {
+  if (!proxy && proxy !== false && !isNodeEnvProxyEnabled(proxyEnvAgent)) {
     const proxyUrl = getProxyForUrl(location);
     if (proxyUrl) {
       if (!shouldBypassProxy(location)) {
@@ -62684,14 +60942,6 @@ function setProxy(
   // (which won't carry the marker) is left alone.
   if (isRedirect && options.agent && options.agent[kAxiosInstalledTunnel]) {
     options.agent = undefined;
-  }
-  if (
-    isRedirect &&
-    options.agents &&
-    options.agents.https &&
-    options.agents.https[kAxiosInstalledTunnel]
-  ) {
-    options.agents.https = configHttpsAgent;
   }
   if (proxy) {
     // Read proxy fields without traversing the prototype chain. URL instances expose
@@ -62824,14 +61074,9 @@ function setProxy(
       redirectOptions.href,
       true,
       configHttpsAgent,
-      configHttpAgent,
-      allowEnvProxy
+      configHttpAgent
     );
   };
-
-  return Boolean(
-    proxy || (configProxy !== false && allowEnvProxy && isNodeEnvProxyEnabled(proxyEnvAgent))
-  );
 }
 
 const isHttpAdapterSupported =
@@ -62866,7 +61111,7 @@ const wrapAsync = (asyncExecutor) => {
 
 const resolveFamily = ({ address, family }) => {
   if (!utils.isString(address)) {
-    throw new core_AxiosError('address must be a string', core_AxiosError.ERR_BAD_OPTION_VALUE);
+    throw TypeError('address must be a string');
   }
   return {
     address,
@@ -62876,43 +61121,6 @@ const resolveFamily = ({ address, family }) => {
 
 const buildAddressEntry = (address, family) =>
   resolveFamily(utils.isObject(address) ? address : { address, family });
-
-const normalizedLookupCache = new WeakMap();
-
-const normalizeLookup = (lookup) => {
-  let normalized = normalizedLookupCache.get(lookup);
-
-  if (normalized) {
-    return normalized;
-  }
-
-  const callbackLookup = helpers_callbackify(lookup, (value) => (utils.isArray(value) ? value : [value]));
-
-  // Support opt.all, which is required by current Node.js releases.
-  normalized = (hostname, opt, cb) => {
-    callbackLookup(hostname, opt, (err, arg0, arg1) => {
-      if (err) {
-        return cb(err);
-      }
-
-      let addresses;
-
-      try {
-        addresses = utils.isArray(arg0)
-          ? arg0.map((addr) => buildAddressEntry(addr))
-          : [buildAddressEntry(arg0, arg1)];
-      } catch (error) {
-        return cb(error);
-      }
-
-      opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
-    });
-  };
-
-  normalizedLookupCache.set(lookup, normalized);
-
-  return normalized;
-};
 
 const http2Transport = {
   request(options, cb) {
@@ -62978,11 +61186,10 @@ const http2Transport = {
       let family = own('family');
       let httpVersion = own('httpVersion');
       if (httpVersion === undefined) httpVersion = 1;
-      const rawHttpVersion = httpVersion;
       let http2Options = own('http2Options');
-      const configProxy = own('proxy');
       const httpAgent = own('httpAgent');
       const httpsAgent = own('httpsAgent');
+      const configProxy = own('proxy');
       const responseType = own('responseType');
       const responseEncoding = own('responseEncoding');
       const socketPath = own('socketPath');
@@ -62996,36 +61203,34 @@ const http2Transport = {
       let req;
       let connectPhaseTimer;
 
-      try {
-        httpVersion = +httpVersion;
-      } catch (err) {
-        throw new core_AxiosError(
-          'Invalid protocol version: value is not a number',
-          core_AxiosError.ERR_BAD_OPTION_VALUE,
-          config
-        );
-      }
+      httpVersion = +httpVersion;
 
       if (Number.isNaN(httpVersion)) {
-        throw new core_AxiosError(
-          `Invalid protocol version: '${rawHttpVersion}' is not a number`,
-          core_AxiosError.ERR_BAD_OPTION_VALUE,
-          config
-        );
+        throw TypeError(`Invalid protocol version: '${config.httpVersion}' is not a number`);
       }
 
       if (httpVersion !== 1 && httpVersion !== 2) {
-        throw new core_AxiosError(
-          `Unsupported protocol version '${httpVersion}'`,
-          core_AxiosError.ERR_BAD_OPTION_VALUE,
-          config
-        );
+        throw TypeError(`Unsupported protocol version '${httpVersion}'`);
       }
 
       const isHttp2 = httpVersion === 2;
 
       if (lookup) {
-        lookup = normalizeLookup(lookup);
+        const _lookup = helpers_callbackify(lookup, (value) => (utils.isArray(value) ? value : [value]));
+        // hotfix to support opt.all option which is required for node 20.x
+        lookup = (hostname, opt, cb) => {
+          _lookup(hostname, opt, (err, arg0, arg1) => {
+            if (err) {
+              return cb(err);
+            }
+
+            const addresses = utils.isArray(arg0)
+              ? arg0.map((addr) => buildAddressEntry(addr))
+              : [buildAddressEntry(arg0, arg1)];
+
+            opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
+          });
+        };
       }
 
       const abortEmitter = new external_events_.EventEmitter();
@@ -63118,9 +61323,7 @@ const http2Transport = {
       // prototype cannot influence URL base selection.
       const urlBase = socketPath
         ? 'http://localhost'
-        : lib_platform.hasBrowserEnv
-          ? lib_platform.origin
-          : undefined;
+        : (lib_platform.hasBrowserEnv ? lib_platform.origin : undefined);
       const parsed = new URL(fullPath, urlBase);
       const protocol = parsed.protocol || supportedProtocols[0];
 
@@ -63129,7 +61332,7 @@ const http2Transport = {
         if (maxContentLength > -1) {
           // Use the exact string passed to fromDataURI (the configured url); fall back to fullPath if needed.
           const dataUrl = String(own('url') || fullPath || '');
-          const estimated = estimateDataURLBufferAllocation(dataUrl);
+          const estimated = estimateDataURLDecodedBytes(dataUrl);
 
           if (estimated > maxContentLength) {
             return reject(
@@ -63159,20 +61362,6 @@ const http2Transport = {
           });
         } catch (err) {
           throw core_AxiosError.from(err, core_AxiosError.ERR_BAD_REQUEST, config);
-        }
-
-        // Check bytes before converting the result to text or a stream.
-        if (
-          maxContentLength > -1 &&
-          (responseType === 'blob' ? convertedData.size : convertedData.length) > maxContentLength
-        ) {
-          return reject(
-            new core_AxiosError(
-              'maxContentLength size of ' + maxContentLength + ' exceeded',
-              core_AxiosError.ERR_BAD_RESPONSE,
-              config
-            )
-          );
         }
 
         if (responseType === 'text') {
@@ -63310,7 +61499,7 @@ const http2Transport = {
               data,
               progressEventDecorator(
                 contentLength,
-                progressEventReducer(asyncDecorator(onUploadProgress, scheduleProgress), false, 3)
+                progressEventReducer(asyncDecorator(onUploadProgress), false, 3)
               )
             )
           );
@@ -63345,7 +61534,7 @@ const http2Transport = {
         return reject(
           core_AxiosError.from(err, core_AxiosError.ERR_BAD_REQUEST, config, null, null, {
             url: own('url'),
-            exists: true,
+            exists: true
           })
         );
       }
@@ -63353,15 +61542,9 @@ const http2Transport = {
       headers.set(
         'Accept-Encoding',
         utils.hasOwnProp(transitional, 'advertiseZstdAcceptEncoding') &&
-          transitional.advertiseZstdAcceptEncoding === true
-          ? ACCEPT_ENCODING_WITH_ZSTD
-          : ACCEPT_ENCODING,
+        transitional.advertiseZstdAcceptEncoding === true ? ACCEPT_ENCODING_WITH_ZSTD : ACCEPT_ENCODING,
         false
       );
-
-      if (isHttp2 && lookup) {
-        http2Options = Object.assign(Object.create(null), http2Options, { lookup });
-      }
 
       // Null-prototype to block prototype pollution gadgets on properties read
       // directly by Node's http.request (e.g. insecureHTTPParser, lookup).
@@ -63376,13 +61559,10 @@ const http2Transport = {
         beforeRedirect: dispatchBeforeRedirect,
         beforeRedirects: Object.create(null),
         http2Options,
-        createConnection: undefined,
       });
 
       // cacheable-lookup integration hotfix
       !utils.isUndefined(lookup) && (options.lookup = lookup);
-
-      let proxyApplied = false;
 
       if (socketPath) {
         if (typeof socketPath !== 'string') {
@@ -63419,44 +61599,30 @@ const http2Transport = {
           ? parsed.hostname.slice(1, -1)
           : parsed.hostname;
         options.port = parsed.port;
-        proxyApplied = setProxy(
+        setProxy(
           options,
           configProxy,
           protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path,
           false,
           httpsAgent,
-          httpAgent,
-          // The HTTP/2 transport connects independently of HTTP/1 agents, so it
-          // cannot apply either axios-resolved or agent-local environment proxies.
-          // Explicit proxy config is still processed and rejected below.
-          !isHttp2
+          httpAgent
         );
       }
       let transport;
       let isNativeTransport = false;
+      // True only for the follow-redirects transport, which applies
+      // options.maxBodyLength itself. Every other transport (http2, native
+      // http/https, a user-supplied custom transport) needs the explicit
+      // byte-counting pipeline below to enforce maxBodyLength on streamed uploads.
+      let transportEnforcesMaxBodyLength = false;
       const isHttpsRequest = http_isHttps.test(options.protocol);
       // Don't clobber a CONNECT-tunneling agent installed by setProxy() for an
       // HTTPS target.
-      if (!isHttp2 && configProxy === false) {
-        setDirectAgent(options, httpAgent, httpsAgent);
-        options.beforeRedirects.direct = (redirectOptions) => {
-          setDirectAgent(redirectOptions, httpAgent, httpsAgent);
-        };
-      } else if (options.agent == null) {
+      if (options.agent == null) {
         options.agent = isHttpsRequest ? httpsAgent : httpAgent;
       }
 
       if (isHttp2) {
-        if (proxyApplied) {
-          return reject(
-            new core_AxiosError(
-              'HTTP/2 requests with a proxy are not supported',
-              core_AxiosError.ERR_NOT_SUPPORT,
-              config
-            )
-          );
-        }
-
         transport = http2Transport;
       } else {
         const configTransport = own('transport');
@@ -63466,6 +61632,7 @@ const http2Transport = {
           transport = isHttpsRequest ? external_https_ : external_http_;
           isNativeTransport = true;
         } else {
+          transportEnforcesMaxBodyLength = true;
           options.sensitiveHeaders = [];
           if (maxRedirects) {
             options.maxRedirects = maxRedirects;
@@ -63570,11 +61737,7 @@ const http2Transport = {
                 transformStream,
                 progressEventDecorator(
                   responseLength,
-                  progressEventReducer(
-                    asyncDecorator(onDownloadProgress, scheduleProgress),
-                    true,
-                    3
-                  )
+                  progressEventReducer(asyncDecorator(onDownloadProgress), true, 3)
                 )
               )
             );
@@ -63772,10 +61935,18 @@ const http2Transport = {
           socket.setKeepAlive(true, 1000 * 60);
         }
 
-        // Install one shared 'error' listener per socket. The symbol follows the
-        // currently-active request as pooled sockets are reassigned (issue #10780).
+        // Install a single 'error' listener per socket (not per request) to avoid
+        // accumulating listeners on pooled keep-alive sockets that get reassigned
+        // to new requests before the previous request's 'close' fires (issue #10780).
+        // The listener is bound to the socket's currently-active request via a
+        // symbol, which is swapped as the socket is reassigned.
         if (!socket[kAxiosSocketListener]) {
-          socket.on('error', handleSocketError);
+          socket.on('error', function handleSocketError(err) {
+            const current = socket[kAxiosCurrentReq];
+            if (current && !current.destroyed) {
+              current.destroy(err);
+            }
+          });
           socket[kAxiosSocketListener] = true;
         }
 
@@ -63855,10 +62026,12 @@ const http2Transport = {
           }
         });
 
-        // Transform decodes string chunks to Buffers before counting, so every
-        // transport receives at most maxBodyLength encoded bytes.
+        // Enforce maxBodyLength for streamed uploads on every transport that
+        // does not apply options.maxBodyLength itself (native http/https, http2,
+        // and user-supplied custom transports). The follow-redirects transport
+        // enforces it on the redirected HTTP/1 path.
         let uploadStream = data;
-        if (maxBodyLength > -1) {
+        if (maxBodyLength > -1 && !transportEnforcesMaxBodyLength) {
           const limit = maxBodyLength;
           let bytesSent = 0;
           uploadStream = external_stream_.pipeline(
@@ -63897,22 +62070,30 @@ const http2Transport = {
   });
 
 const __setProxy = (/* unused pure expression or super */ null && (setProxy));
-const __getDirectAgent = (/* unused pure expression or super */ null && (getDirectAgent));
-const __isNodeNativeEnvProxySupported = (/* unused pure expression or super */ null && (isNodeNativeEnvProxySupported));
 const __isNodeEnvProxyEnabled = (/* unused pure expression or super */ null && (isNodeEnvProxyEnabled));
 const __isSameOriginRedirect = (/* unused pure expression or super */ null && (isSameOriginRedirect));
+
+;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/isURLSameOrigin.js
+
+
+/* harmony default export */ const isURLSameOrigin = (lib_platform.hasStandardBrowserEnv
+  ? ((origin, isMSIE) => (url) => {
+      url = new URL(url, lib_platform.origin);
+
+      return (
+        origin.protocol === url.protocol &&
+        origin.host === url.host &&
+        (isMSIE || origin.port === url.port)
+      );
+    })(
+      new URL(lib_platform.origin),
+      lib_platform.navigator && /(msie|trident)/i.test(lib_platform.navigator.userAgent)
+    )
+  : () => true);
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/cookies.js
 
 
-
-const decodeCookieValue = (value) => {
-  try {
-    return decodeURIComponent(value);
-  } catch (e) {
-    return value;
-  }
-};
 
 /* harmony default export */ const cookies = (lib_platform.hasStandardBrowserEnv
   ? // Standard browser envs support document.cookie
@@ -63943,37 +62124,24 @@ const decodeCookieValue = (value) => {
 
       read(name) {
         if (typeof document === 'undefined') return null;
-        const cookieString = document.cookie;
-        if (!cookieString) return null;
         // Match name=value by splitting on the semicolon separator instead of building a
         // RegExp from `name` — interpolating an unescaped string into a RegExp would let
         // metacharacters (e.g. `.+?` in an attacker-influenced cookie name) cause ReDoS or
         // match the wrong cookie. Browsers may serialize cookie pairs as either ";" or
         // "; ", so ignore optional whitespace before each cookie name.
-        const cookies = cookieString.split(';');
+        const cookies = document.cookie.split(';');
         for (let i = 0; i < cookies.length; i++) {
           const cookie = cookies[i].replace(/^\s+/, '');
           const eq = cookie.indexOf('=');
           if (eq !== -1 && cookie.slice(0, eq) === name) {
-            return decodeCookieValue(cookie.slice(eq + 1));
+            try {
+              return decodeURIComponent(cookie.slice(eq + 1));
+            } catch (e) {
+              return cookie.slice(eq + 1);
+            }
           }
         }
         return null;
-      },
-
-      async readAsync(name) {
-        try {
-          const store = typeof window !== 'undefined' && window.cookieStore;
-          if (store && utils.isFunction(store.get)) {
-            const cookie = await store.get(name);
-            // Both APIs expose stored bytes; preserve Axios's existing URI decoding.
-            return cookie ? decodeCookieValue(cookie.value) : null;
-          }
-        } catch (e) {
-          // Restricted or unavailable storage retains the synchronous fallback.
-        }
-
-        return this.read(name);
       },
 
       remove(name) {
@@ -63986,75 +62154,8 @@ const decodeCookieValue = (value) => {
       read() {
         return null;
       },
-      async readAsync() {
-        return null;
-      },
       remove() {},
     });
-
-;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/isURLSameOrigin.js
-
-
-/* harmony default export */ const isURLSameOrigin = (lib_platform.hasStandardBrowserEnv
-  ? ((origin) => (url) => {
-      url = new URL(url, document.baseURI || lib_platform.origin);
-
-      return (
-        origin.protocol === url.protocol && origin.host === url.host && origin.port === url.port
-      );
-    })(new URL(lib_platform.origin))
-  : () => true);
-
-;// CONCATENATED MODULE: ./node_modules/axios/lib/core/assertParamsAcyclic.js
-
-
-
-
-
-function assertParamsAcyclic(params) {
-  const pending = [{ value: params }];
-  const active = new WeakSet();
-  const visited = new WeakSet();
-
-  while (pending.length) {
-    const { value, done } = pending.pop();
-    if (!utils.isPlainObject(value) && !utils.isArray(value)) continue;
-    if (done) {
-      active.delete(value);
-      continue;
-    }
-    if (active.has(value)) {
-      throw new core_AxiosError(
-        'Circular reference detected in params',
-        core_AxiosError.ERR_BAD_OPTION_VALUE
-      );
-    }
-    if (visited.has(value)) continue;
-    visited.add(value);
-    active.add(value);
-    pending.push({ value, done: true });
-
-    const keys = Object.keys(value);
-    if (Object.getOwnPropertySymbols && Object.getOwnPropertyDescriptor) {
-      Object.getOwnPropertySymbols(value).forEach((key) => {
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (descriptor && descriptor.enumerable) keys.push(key);
-      });
-    }
-    // Shallow array elements retain fields filtered during plain-object merges.
-    // Inspect reserved data properties without evaluating their accessors.
-    keys.forEach((key) => {
-      if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (descriptor && utils.hasOwnProp(descriptor, 'value')) {
-          pending.push({ value: descriptor.value });
-        }
-      } else {
-        pending.push({ value: value[key] });
-      }
-    });
-  }
-}
 
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/core/mergeConfig.js
 
@@ -64062,189 +62163,7 @@ function assertParamsAcyclic(params) {
 
 
 
-
 const headersToObject = (thing) => (thing instanceof core_AxiosHeaders ? { ...thing } : thing);
-
-const ownEnumerableKeys = (thing) => {
-  if (Object.getOwnPropertySymbols && Object.getOwnPropertyDescriptor) {
-    return Object.keys(thing).concat(
-      Object.getOwnPropertySymbols(thing).filter((symbol) => {
-        const descriptor = Object.getOwnPropertyDescriptor(thing, symbol);
-        return descriptor && descriptor.enumerable;
-      })
-    );
-  }
-  return Object.keys(thing);
-};
-
-// Copy params without recursive merges so the serializer remains responsible
-// for its depth policy. Only visit defaults that contribute to the result.
-function mergeParams(a, b) {
-  const pending = [];
-  const copies = new WeakMap();
-  const empty = {};
-
-  function copy(target, source) {
-    if (!utils.isPlainObject(source)) {
-      return utils.isArray(source) ? source.slice() : source;
-    }
-
-    const base = utils.isPlainObject(target) ? target : empty;
-    let bases = copies.get(source);
-    if (!bases) {
-      bases = new WeakMap();
-      copies.set(source, bases);
-    }
-    if (bases.has(base)) return bases.get(base);
-
-    const result = {};
-    bases.set(base, result);
-    pending.push({ base, source, result });
-    return result;
-  }
-
-  const result = utils.isUndefined(b) ? copy(undefined, a) : copy(a, b);
-  while (pending.length) {
-    const { base, source, result: target } = pending.pop();
-    const baseKeys = new Set(ownEnumerableKeys(base));
-    const sourceKeys = new Set(ownEnumerableKeys(source));
-    const keys = new Set([...baseKeys, ...sourceKeys]);
-
-    keys.forEach((key) => {
-      if (key === '__proto__' || key === 'constructor' || key === 'prototype') return;
-      const hasSource = sourceKeys.has(key);
-      const value = hasSource ? source[key] : undefined;
-      const previous =
-        (!hasSource || utils.isPlainObject(value)) && baseKeys.has(key) ? base[key] : undefined;
-      target[key] = hasSource ? copy(previous, value) : copy(undefined, previous);
-    });
-  }
-
-  assertParamsAcyclic(result);
-  return result;
-}
-
-function getMergedValue(target, source, prop, caseless) {
-  if (utils.isPlainObject(target) && utils.isPlainObject(source)) {
-    return utils.merge.call({ caseless }, target, source);
-  } else if (utils.isPlainObject(source)) {
-    return utils.merge({}, source);
-  } else if (utils.isArray(source)) {
-    return source.slice();
-  }
-  return source;
-}
-
-function mergeDeepProperties(a, b, prop, caseless) {
-  if (!utils.isUndefined(b)) {
-    return getMergedValue(a, b, prop, caseless);
-  } else if (!utils.isUndefined(a)) {
-    return getMergedValue(undefined, a, prop, caseless);
-  }
-}
-
-// eslint-disable-next-line consistent-return
-function valueFromConfig2(a, b) {
-  if (!utils.isUndefined(b)) {
-    return getMergedValue(undefined, b);
-  }
-}
-
-// eslint-disable-next-line consistent-return
-function defaultToConfig2(a, b) {
-  if (!utils.isUndefined(b)) {
-    return getMergedValue(undefined, b);
-  } else if (!utils.isUndefined(a)) {
-    return getMergedValue(undefined, a);
-  }
-}
-
-function getMergedTransitionalOption(config1, config2, prop) {
-  const transitional2 = utils.hasOwnProp(config2, 'transitional')
-    ? config2.transitional
-    : undefined;
-
-  if (!utils.isUndefined(transitional2)) {
-    if (utils.isPlainObject(transitional2)) {
-      if (utils.hasOwnProp(transitional2, prop)) {
-        return transitional2[prop];
-      }
-    } else {
-      return undefined;
-    }
-  }
-
-  const transitional1 = utils.hasOwnProp(config1, 'transitional')
-    ? config1.transitional
-    : undefined;
-
-  if (utils.isPlainObject(transitional1) && utils.hasOwnProp(transitional1, prop)) {
-    return transitional1[prop];
-  }
-
-  return undefined;
-}
-
-// eslint-disable-next-line consistent-return
-function mergeDirectKeys(a, b, prop, config1, config2) {
-  if (utils.hasOwnProp(config2, prop)) {
-    return getMergedValue(a, b);
-  } else if (utils.hasOwnProp(config1, prop)) {
-    return getMergedValue(undefined, a);
-  }
-}
-
-function mergeHeaders(a, b, prop) {
-  return mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true);
-}
-
-// Null-proto, frozen descriptor so a polluted Object.prototype.get cannot turn
-// this data descriptor into an accessor descriptor on the way in.
-// defineProperty only reads it, so one shared instance serves every call.
-const hasOwnPropertyDescriptor = Object.freeze({
-  __proto__: null,
-  value: Object.prototype.hasOwnProperty,
-  enumerable: false,
-  writable: true,
-  configurable: true,
-});
-
-// The strategy table and the strategies above are stateless, so they are
-// built once at module load instead of on every call: mergeConfig runs at
-// most twice per request (once from a method alias, once from `_request`).
-const mergeMap = {
-  url: valueFromConfig2,
-  method: valueFromConfig2,
-  data: valueFromConfig2,
-  baseURL: defaultToConfig2,
-  transformRequest: defaultToConfig2,
-  transformResponse: defaultToConfig2,
-  params: mergeParams,
-  paramsSerializer: defaultToConfig2,
-  timeout: defaultToConfig2,
-  timeoutErrorMessage: defaultToConfig2,
-  withCredentials: defaultToConfig2,
-  withXSRFToken: defaultToConfig2,
-  adapter: defaultToConfig2,
-  responseType: defaultToConfig2,
-  xsrfCookieName: defaultToConfig2,
-  xsrfHeaderName: defaultToConfig2,
-  onUploadProgress: defaultToConfig2,
-  onDownloadProgress: defaultToConfig2,
-  decompress: defaultToConfig2,
-  maxContentLength: defaultToConfig2,
-  maxBodyLength: defaultToConfig2,
-  beforeRedirect: defaultToConfig2,
-  transport: defaultToConfig2,
-  httpAgent: defaultToConfig2,
-  httpsAgent: defaultToConfig2,
-  cancelToken: defaultToConfig2,
-  socketPath: defaultToConfig2,
-  allowedSocketPaths: defaultToConfig2,
-  responseEncoding: defaultToConfig2,
-  validateStatus: mergeDirectKeys,
-  headers: mergeHeaders,
-};
 
 /**
  * Config-specific merge-function which creates a new config-object
@@ -64265,25 +62184,129 @@ function mergeConfig(config1, config2) {
   // `hasOwnProperty` is restored as a non-enumerable own slot to preserve
   // ergonomics for user code that relies on it.
   const config = Object.create(null);
-  Object.defineProperty(config, 'hasOwnProperty', hasOwnPropertyDescriptor);
+  Object.defineProperty(config, 'hasOwnProperty', {
+    // Null-proto descriptor so a polluted Object.prototype.get cannot turn
+    // this data descriptor into an accessor descriptor on the way in.
+    __proto__: null,
+    value: Object.prototype.hasOwnProperty,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  });
 
-  const keys = ownEnumerableKeys({ ...config1, ...config2 });
+  function getMergedValue(target, source, prop, caseless) {
+    if (utils.isPlainObject(target) && utils.isPlainObject(source)) {
+      return utils.merge.call({ caseless }, target, source);
+    } else if (utils.isPlainObject(source)) {
+      return utils.merge({}, source);
+    } else if (utils.isArray(source)) {
+      return source.slice();
+    }
+    return source;
+  }
 
-  for (let i = 0, len = keys.length; i < len; i++) {
-    const prop = keys[i];
-    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') continue;
+  function mergeDeepProperties(a, b, prop, caseless) {
+    if (!utils.isUndefined(b)) {
+      return getMergedValue(a, b, prop, caseless);
+    } else if (!utils.isUndefined(a)) {
+      return getMergedValue(undefined, a, prop, caseless);
+    }
+  }
+
+  // eslint-disable-next-line consistent-return
+  function valueFromConfig2(a, b) {
+    if (!utils.isUndefined(b)) {
+      return getMergedValue(undefined, b);
+    }
+  }
+
+  // eslint-disable-next-line consistent-return
+  function defaultToConfig2(a, b) {
+    if (!utils.isUndefined(b)) {
+      return getMergedValue(undefined, b);
+    } else if (!utils.isUndefined(a)) {
+      return getMergedValue(undefined, a);
+    }
+  }
+
+  function getMergedTransitionalOption(prop) {
+    const transitional2 = utils.hasOwnProp(config2, 'transitional') ? config2.transitional : undefined;
+
+    if (!utils.isUndefined(transitional2)) {
+      if (utils.isPlainObject(transitional2)) {
+        if (utils.hasOwnProp(transitional2, prop)) {
+          return transitional2[prop];
+        }
+      } else {
+        return undefined;
+      }
+    }
+
+    const transitional1 = utils.hasOwnProp(config1, 'transitional') ? config1.transitional : undefined;
+
+    if (utils.isPlainObject(transitional1) && utils.hasOwnProp(transitional1, prop)) {
+      return transitional1[prop];
+    }
+
+    return undefined;
+  }
+
+  // eslint-disable-next-line consistent-return
+  function mergeDirectKeys(a, b, prop) {
+    if (utils.hasOwnProp(config2, prop)) {
+      return getMergedValue(a, b);
+    } else if (utils.hasOwnProp(config1, prop)) {
+      return getMergedValue(undefined, a);
+    }
+  }
+
+  const mergeMap = {
+    url: valueFromConfig2,
+    method: valueFromConfig2,
+    data: valueFromConfig2,
+    baseURL: defaultToConfig2,
+    transformRequest: defaultToConfig2,
+    transformResponse: defaultToConfig2,
+    paramsSerializer: defaultToConfig2,
+    timeout: defaultToConfig2,
+    timeoutMessage: defaultToConfig2,
+    withCredentials: defaultToConfig2,
+    withXSRFToken: defaultToConfig2,
+    adapter: defaultToConfig2,
+    responseType: defaultToConfig2,
+    xsrfCookieName: defaultToConfig2,
+    xsrfHeaderName: defaultToConfig2,
+    onUploadProgress: defaultToConfig2,
+    onDownloadProgress: defaultToConfig2,
+    decompress: defaultToConfig2,
+    maxContentLength: defaultToConfig2,
+    maxBodyLength: defaultToConfig2,
+    beforeRedirect: defaultToConfig2,
+    transport: defaultToConfig2,
+    httpAgent: defaultToConfig2,
+    httpsAgent: defaultToConfig2,
+    cancelToken: defaultToConfig2,
+    socketPath: defaultToConfig2,
+    allowedSocketPaths: defaultToConfig2,
+    responseEncoding: defaultToConfig2,
+    validateStatus: mergeDirectKeys,
+    headers: (a, b, prop) =>
+      mergeDeepProperties(headersToObject(a), headersToObject(b), prop, true),
+  };
+
+  utils.forEach(Object.keys({ ...config1, ...config2 }), function computeConfigValue(prop) {
+    if (prop === '__proto__' || prop === 'constructor' || prop === 'prototype') return;
     const merge = utils.hasOwnProp(mergeMap, prop) ? mergeMap[prop] : mergeDeepProperties;
     const a = utils.hasOwnProp(config1, prop) ? config1[prop] : undefined;
     const b = utils.hasOwnProp(config2, prop) ? config2[prop] : undefined;
-    const configValue =
-      merge === mergeDirectKeys ? merge(a, b, prop, config1, config2) : merge(a, b, prop);
+    const configValue = merge(a, b, prop);
     (utils.isUndefined(configValue) && merge !== mergeDirectKeys) || (config[prop] = configValue);
-  }
+  });
 
   if (
     utils.hasOwnProp(config2, 'validateStatus') &&
     utils.isUndefined(config2.validateStatus) &&
-    getMergedTransitionalOption(config1, config2, 'validateStatusUndefinedResolves') === false
+    getMergedTransitionalOption('validateStatusUndefinedResolves') === false
   ) {
     if (utils.hasOwnProp(config1, 'validateStatus')) {
       config.validateStatus = getMergedValue(undefined, config1.validateStatus);
@@ -64306,6 +62329,20 @@ function mergeConfig(config1, config2) {
 
 
 
+const resolveConfig_FORM_DATA_CONTENT_HEADERS = ['content-type', 'content-length'];
+
+function resolveConfig_setFormDataHeaders(headers, formHeaders, policy) {
+  if (policy !== 'content-only') {
+    headers.set(formHeaders);
+    return;
+  }
+
+  Object.entries(formHeaders || {}).forEach(([key, val]) => {
+    if (resolveConfig_FORM_DATA_CONTENT_HEADERS.includes(key.toLowerCase())) {
+      headers.set(key, val);
+    }
+  });
+}
 
 /**
  * Encode a UTF-8 string to a Latin-1 byte string for use with btoa().
@@ -64320,9 +62357,7 @@ const encodeUTF8 = (str) =>
     String.fromCharCode(parseInt(hex, 16))
   );
 
-const readCookie = (name) => cookies.read(name);
-
-function resolveConfig(config, readXsrfCookie = readCookie) {
+function resolveConfig(config) {
   const newConfig = mergeConfig({}, config);
 
   // Read only own properties to prevent prototype pollution gadgets
@@ -64351,22 +62386,11 @@ function resolveConfig(config, readXsrfCookie = readCookie) {
   if (auth) {
     const username = utils.getSafeProp(auth, 'username') || '';
     const password = utils.getSafeProp(auth, 'password') || '';
-    const transitional = own('transitional');
-    const encodeUsername =
-      transitional &&
-      utils.hasOwnProp(transitional, 'encodeBasicAuthUsername') &&
-      transitional.encodeBasicAuthUsername === true;
 
     try {
       headers.set(
         'Authorization',
-        // Preserve legacy username bytes unless the caller opts in to UTF-8.
-        'Basic ' +
-          btoa(
-            (encodeUsername ? encodeUTF8(username) : username) +
-              ':' +
-              (password ? encodeUTF8(password) : '')
-          )
+        'Basic ' + btoa(username + ':' + (password ? encodeUTF8(password) : ''))
       );
     } catch (e) {
       throw core_AxiosError.from(e, core_AxiosError.ERR_BAD_OPTION_VALUE, config);
@@ -64374,17 +62398,15 @@ function resolveConfig(config, readXsrfCookie = readCookie) {
   }
 
   if (utils.isFormData(data)) {
-    const getHeaders = utils.getSafeProp(data, 'getHeaders');
-
     if (
       lib_platform.hasStandardBrowserEnv ||
       lib_platform.hasStandardBrowserWebWorkerEnv ||
       utils.isReactNative(data)
     ) {
       headers.setContentType(undefined); // browser/web worker/RN handles it
-    } else if (utils.isFunction(getHeaders)) {
+    } else if (utils.isFunction(data.getHeaders)) {
       // Node.js FormData (like form-data package)
-      setFormDataHeaders(headers, getHeaders.call(data), own('formDataHeaderPolicy'));
+      resolveConfig_setFormDataHeaders(headers, data.getHeaders(), own('formDataHeaderPolicy'));
     }
   }
 
@@ -64404,7 +62426,7 @@ function resolveConfig(config, readXsrfCookie = readCookie) {
       withXSRFToken === true || (withXSRFToken == null && isURLSameOrigin(newConfig.url));
 
     if (shouldSendXSRF) {
-      const xsrfValue = xsrfHeaderName && xsrfCookieName && readXsrfCookie(xsrfCookieName);
+      const xsrfValue = xsrfHeaderName && xsrfCookieName && cookies.read(xsrfCookieName);
 
       if (xsrfValue) {
         headers.set(xsrfHeaderName, xsrfValue);
@@ -64430,67 +62452,22 @@ function resolveConfig(config, readXsrfCookie = readCookie) {
 
 
 
-
-
 const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 
 /* harmony default export */ const xhr = (isXHRAdapterSupported &&
   function (config) {
     return new Promise(function dispatchXhrRequest(resolve, reject) {
-      let useAsyncXsrf;
-      try {
-        const store =
-          lib_platform.hasStandardBrowserEnv && typeof window !== 'undefined' && window.cookieStore;
-        useAsyncXsrf = store && utils.isFunction(store.get);
-      } catch (e) {
-        // A restricted Cookie Store getter must retain the synchronous fallback.
-      }
-      let xsrfCookieName;
-      const _config = helpers_resolveConfig(
-        config,
-        useAsyncXsrf
-          ? (name) => {
-              xsrfCookieName = name;
-              return null;
-            }
-          : undefined
-      );
+      const _config = helpers_resolveConfig(config);
       let requestData = _config.data;
       const requestHeaders = core_AxiosHeaders.from(_config.headers).normalize();
       let { responseType, onUploadProgress, onDownloadProgress } = _config;
       let onCanceled;
-      let timeoutId;
       let uploadThrottled, downloadThrottled;
-      let flushUpload, flushDownload, flushDownloadWithEvent;
+      let flushUpload, flushDownload;
 
       function done() {
-        clearTimeout(timeoutId);
-        // A final progress callback must not prevent the remaining cleanup.
-        // Report errors asynchronously, as onloadend and the throttle timer do.
-        try {
-          flushUpload && flushUpload(); // flush events
-        } catch (err) {
-          setTimeout(() => {
-            throw err;
-          });
-        }
-        try {
-          flushDownload && flushDownload(); // flush events
-        } catch (err) {
-          setTimeout(() => {
-            throw err;
-          });
-        }
-
-        // A flush can synchronously cancel the request and reenter done().
-        // In that case the inner call has already detached these listeners.
-        if (request) {
-          downloadThrottled && request.removeEventListener('progress', downloadThrottled);
-          if (request.upload) {
-            uploadThrottled && request.upload.removeEventListener('progress', uploadThrottled);
-            flushUpload && request.upload.removeEventListener('loadend', flushUpload);
-          }
-        }
+        flushUpload && flushUpload(); // flush events
+        flushDownload && flushDownload(); // flush events
 
         _config.cancelToken && _config.cancelToken.unsubscribe(onCanceled);
 
@@ -64504,55 +62481,10 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
       // Set the request timeout in MS
       request.timeout = _config.timeout;
 
-      function onloadend(event) {
+      function onloadend() {
         if (!request) {
           return;
         }
-
-        // Status 0 means no response was received, which onerror and onabort normally
-        // reject before this runs. Firefox 152 fires only readystatechange and loadend for
-        // navigation-canceled requests (https://bugzilla.mozilla.org/show_bug.cgi?id=1505389),
-        // leaving settle() to resolve them as an empty success. ECONNABORTED is the error
-        // onabort raised on Firefox 151. Reads over file:, which some environments report as
-        // status 0 on success, are excluded by the request URL's scheme after browser-style
-        // preprocessing, by the page origin's scheme for relative URLs (which inherit it), or
-        // by responseURL where implemented.
-        if (
-          request.status === 0 &&
-          (parseProtocol(normalizeURLForProtocolCheck(_config.url)) ||
-            parseProtocol(lib_platform.origin)) !== 'file' &&
-          !(request.responseURL && request.responseURL.startsWith('file:'))
-        ) {
-          reject(new core_AxiosError('Request aborted', core_AxiosError.ECONNABORTED, config, request));
-          done();
-
-          // Clean up request
-          request = null;
-          return;
-        }
-
-        // When loadend is still dispatching, flushing with it gives progress
-        // listeners a final delivery whose event has a live target. The legacy
-        // ready-state fallback has no event, so replay its pending progress.
-        // A throwing listener must not block settlement; rethrow asynchronously,
-        // matching how listener errors surface on the throttle timer path.
-        try {
-          if (event) {
-            flushDownloadWithEvent && flushDownloadWithEvent(event);
-          } else {
-            flushDownload && flushDownload();
-          }
-        } catch (err) {
-          setTimeout(() => {
-            throw err;
-          });
-        }
-
-        // A final progress callback can cancel the request synchronously.
-        if (!request) {
-          return;
-        }
-
         // Prepare the response
         const responseHeaders = core_AxiosHeaders.from(
           'getAllResponseHeaders' in request && request.getAllResponseHeaders()
@@ -64641,7 +62573,6 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 
       // Handle timeout
       request.ontimeout = function handleTimeout() {
-        if (!request) return;
         let timeoutErrorMessage = _config.timeout
           ? 'timeout of ' + _config.timeout + 'ms exceeded'
           : 'timeout exceeded';
@@ -64666,6 +62597,13 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
       // Remove Content-Type if data is undefined
       requestData === undefined && requestHeaders.setContentType(null);
 
+      // Add headers to the request
+      if ('setRequestHeader' in request) {
+        utils.forEach(toByteStringHeaderObject(requestHeaders), function setRequestHeader(val, key) {
+          request.setRequestHeader(key, val);
+        });
+      }
+
       // Add withCredentials to request if needed
       if (!utils.isUndefined(_config.withCredentials)) {
         request.withCredentials = !!_config.withCredentials;
@@ -64678,10 +62616,7 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
 
       // Handle progress if needed
       if (onDownloadProgress) {
-        [downloadThrottled, flushDownload, flushDownloadWithEvent] = progressEventReducer(
-          onDownloadProgress,
-          true
-        );
+        [downloadThrottled, flushDownload] = progressEventReducer(onDownloadProgress, true);
         request.addEventListener('progress', downloadThrottled);
       }
 
@@ -64702,22 +62637,18 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
             return;
           }
           reject(!cancel || cancel.type ? new cancel_CanceledError(null, config, request) : cancel);
-          const xhr = request;
+          request.abort();
           done();
           request = null;
-          xhr.abort();
         };
 
         _config.cancelToken && _config.cancelToken.subscribe(onCanceled);
-        if (!request) return;
         if (_config.signal) {
           _config.signal.aborted
             ? onCanceled()
             : _config.signal.addEventListener('abort', onCanceled);
         }
       }
-
-      if (!request) return;
 
       const protocol = parseProtocol(_config.url);
 
@@ -64733,73 +62664,8 @@ const isXHRAdapterSupported = typeof XMLHttpRequest !== 'undefined';
         return;
       }
 
-      const sendRequest = () => {
-        if (!request) return;
-        // Apply headers after an asynchronous XSRF read so existing headers are
-        // replaced through AxiosHeaders rather than appended by the native XHR.
-        if ('setRequestHeader' in request) {
-          utils.forEach(
-            toByteStringHeaderObject(requestHeaders),
-            function setRequestHeader(val, key) {
-              request.setRequestHeader(key, val);
-            }
-          );
-        }
-        request.send(requestData || null);
-      };
-
-      if (xsrfCookieName) {
-        // Native XHR timeout starts at send(). Cover cookie preparation and the
-        // subsequent request with the same budget and existing timeout handler.
-        const now =
-          typeof performance !== 'undefined' && utils.isFunction(performance.now)
-            ? () => performance.now()
-            : Date.now;
-        const deadline = request.timeout > 0 ? now() + Number(request.timeout) : undefined;
-        const abortOnTimeout = () => {
-          if (!request) return;
-          const xhr = request;
-          xhr.ontimeout();
-          xhr.abort();
-        };
-        if (deadline !== undefined) {
-          const scheduleTimeout = () => {
-            const remaining = deadline - now();
-            if (remaining > 0) {
-              // Browser timers overflow above the signed 32-bit delay limit.
-              timeoutId = setTimeout(scheduleTimeout, Math.min(remaining, 0x7fffffff));
-            } else {
-              abortOnTimeout();
-            }
-          };
-          scheduleTimeout();
-        }
-
-        cookies
-          .readAsync(xsrfCookieName)
-          .then((value) => {
-            if (!request) return;
-            // Promise callbacks may run before an overdue timer after a busy task.
-            if (deadline !== undefined && now() >= deadline) {
-              abortOnTimeout();
-              return;
-            }
-            if (value) {
-              const headerName =
-                utils.hasOwnProp(_config, 'xsrfHeaderName') && _config.xsrfHeaderName;
-              requestHeaders.set(headerName, value);
-            }
-            sendRequest();
-          })
-          .catch((error) => {
-            if (!request) return;
-            reject(core_AxiosError.from(error, null, config, request));
-            done();
-            request = null;
-          });
-      } else {
-        sendRequest();
-      }
+      // Send the request
+      request.send(requestData || null);
     });
   });
 
@@ -64840,32 +62706,18 @@ const composeSignals = (signals, timeout) => {
     }, timeout);
 
   const unsubscribe = () => {
-    if (!signals) {
-      return;
-    }
+    if (!signals) { return; }
     timer && clearTimeout(timer);
     timer = null;
     signals.forEach((signal) => {
-      const unsubscribeSignal = utils.getSafeProp(signal, 'unsubscribe');
-      utils.isFunction(unsubscribeSignal)
-        ? unsubscribeSignal.call(signal, onabort)
+      signal.unsubscribe
+        ? signal.unsubscribe(onabort)
         : signal.removeEventListener('abort', onabort);
     });
     signals = null;
   };
 
-  signals.forEach((signal) => {
-    if (aborted) {
-      return;
-    }
-
-    if (signal.aborted) {
-      onabort.call(signal);
-      return;
-    }
-
-    signal.addEventListener('abort', onabort, { once: true });
-  });
+  signals.forEach((signal) => signal.addEventListener('abort', onabort, { once: true }));
 
   const { signal } = controller;
 
@@ -64967,160 +62819,6 @@ const trackStream = (stream, chunkSize, onProgress, onFinish) => {
   );
 };
 
-;// CONCATENATED MODULE: ./node_modules/axios/lib/helpers/formDataToBlob.js
-
-
-const formDataToBlob_CRLF = '\r\n';
-const normalizeLines = (value) => String(value).replace(/\r\n|\r|\n/g, formDataToBlob_CRLF);
-const escapeName = (value) =>
-  String(value).replace(/[\r\n"]/g, (char) =>
-    char === '\r' ? '%0D' : char === '\n' ? '%0A' : '%22'
-  );
-
-// Count UTF-8 bytes without allocating an encoded copy of a field. FormData
-// string values normalize line endings; Blob/File contents remain unchanged.
-const stringBytes = (value, normalize) => {
-  let length = 0;
-  for (let i = 0; i < value.length; i++) {
-    const code = value.charCodeAt(i);
-    if (normalize && (code === 13 || code === 10)) {
-      if (code === 13 && value.charCodeAt(i + 1) === 10) i++;
-      length += 2;
-    } else if (code < 0x80) {
-      length++;
-    } else if (code < 0x800) {
-      length += 2;
-    } else if (
-      code >= 0xd800 &&
-      code <= 0xdbff &&
-      value.charCodeAt(i + 1) >= 0xdc00 &&
-      value.charCodeAt(i + 1) <= 0xdfff
-    ) {
-      length += 4;
-      i++;
-    } else {
-      length += 3;
-    }
-  }
-  return length;
-};
-
-// Describe serialization failures independently of any request library.
-class FormDataError extends TypeError {
-  constructor(message, reason) {
-    super(message);
-    this.name = 'FormDataError';
-    this.reason = reason;
-  }
-}
-
-// The caller supplies the boundary, Blob implementation, and limit error.
-function formDataToBlob(form, Blob, limit, limitError, boundary) {
-  if (!utils.isFunction(Blob)) {
-    throw new FormDataError('Blob is not supported', 'blob');
-  }
-
-  if (
-    !utils.isString(boundary) ||
-    !/^[A-Za-z0-9'()+_,./:=? -]{1,70}$/.test(boundary) ||
-    / $/.test(boundary)
-  ) {
-    throw new FormDataError('Invalid multipart boundary', 'boundary');
-  }
-  const footer = '--' + boundary + '--' + formDataToBlob_CRLF;
-  let length = footer.length;
-  const parts = [];
-  const checkLength = (extra) => {
-    if (length + extra > limit) throw limitError();
-  };
-  checkLength(0);
-
-  for (const [name, value] of form) {
-    const isString = utils.isString(value);
-    const valueLength = isString ? stringBytes(value, true) : value.size;
-    if (!Number.isFinite(valueLength) || valueLength < 0) {
-      throw new FormDataError('Unsupported FormData part size', 'part');
-    }
-    // Reject large values and names before building normalized header strings.
-    checkLength(
-      valueLength +
-        stringBytes(name, true) +
-        (!isString && value.name ? stringBytes(value.name, false) : 0) +
-        (!isString && value.type ? stringBytes(value.type, false) : 0)
-    );
-
-    let header =
-      '--' +
-      boundary +
-      formDataToBlob_CRLF +
-      'Content-Disposition: form-data; name="' +
-      escapeName(normalizeLines(name)) +
-      '"';
-    if (!isString) {
-      header +=
-        '; filename="' +
-        escapeName(utils.isString(value.name) ? value.name : 'blob') +
-        '"' +
-        formDataToBlob_CRLF +
-        'Content-Type: ' +
-        String(value.type || 'application/octet-stream').replace(/[\r\n]/g, '');
-    }
-    header += formDataToBlob_CRLF + formDataToBlob_CRLF;
-    const partLength = stringBytes(header, false) + valueLength + formDataToBlob_CRLF.length;
-    checkLength(partLength);
-    length += partLength;
-    parts.push({ header, value, isString });
-  }
-
-  // Native Blob composition retains existing Blob/File data. No file is read
-  // and no complete multipart ArrayBuffer is created to determine its length.
-  const blobParts = [];
-  for (const part of parts) {
-    blobParts.push(part.header, part.isString ? normalizeLines(part.value) : part.value, formDataToBlob_CRLF);
-  }
-  blobParts.push(footer);
-  return new Blob(blobParts, { type: 'multipart/form-data; boundary=' + boundary });
-}
-
-;// CONCATENATED MODULE: ./node_modules/axios/lib/core/createMultipartBody.js
-
-
-
-
-
-function createMultipartBody(form, Blob, limit, limitError, boundary) {
-  // Report missing Blob support before trying to select a random source.
-  if (!utils.isFunction(Blob)) {
-    throw new core_AxiosError('Blob is not supported', core_AxiosError.ERR_NOT_SUPPORT);
-  }
-
-  if (boundary === undefined) {
-    if (utils.isFunction(lib_platform.generateString)) {
-      boundary = 'axios-' + lib_platform.generateString(36, '0123456789abcdef');
-    } else {
-      const crypto = utils.global.crypto;
-      if (!crypto || !utils.isFunction(crypto.getRandomValues)) {
-        throw new core_AxiosError('Random byte generation is not supported', core_AxiosError.ERR_NOT_SUPPORT);
-      }
-      const random = new Uint8Array(18);
-      crypto.getRandomValues(random);
-      boundary =
-        'axios-' + Array.from(random, (value) => ('0' + value.toString(16)).slice(-2)).join('');
-    }
-  }
-
-  try {
-    return formDataToBlob(form, Blob, limit, limitError, boundary);
-  } catch (error) {
-    if (error instanceof FormDataError) {
-      const code =
-        error.reason === 'boundary' ? core_AxiosError.ERR_BAD_OPTION_VALUE : core_AxiosError.ERR_BAD_REQUEST;
-      throw new core_AxiosError(error.message, code);
-    }
-    throw error;
-  }
-}
-
 ;// CONCATENATED MODULE: ./node_modules/axios/lib/adapters/fetch.js
 
 
@@ -65135,20 +62833,7 @@ function createMultipartBody(form, Blob, limit, limitError, boundary) {
 
 
 
-
 const DEFAULT_CHUNK_SIZE = 64 * 1024;
-
-const DEFAULT_REQUEST_OPTIONS = {
-  cache: 'default',
-  redirect: 'follow',
-  referrer: 'about:client',
-  referrerPolicy: '',
-  mode: 'cors',
-  integrity: '',
-  keepalive: false,
-  priority: 'auto',
-  window: null,
-};
 
 const { isFunction: fetch_isFunction } = utils;
 
@@ -65200,7 +62885,9 @@ const maybeWithAuthCredentials = (url) => {
 
 const factory = (env) => {
   const globalObject =
-    utils.global !== undefined && utils.global !== null ? utils.global : globalThis;
+    utils.global !== undefined && utils.global !== null
+      ? utils.global
+      : globalThis;
   const { ReadableStream, TextEncoder } = globalObject;
 
   env = utils.merge.call(
@@ -65210,13 +62897,11 @@ const factory = (env) => {
     {
       Request: globalObject.Request,
       Response: globalObject.Response,
-      Blob: globalObject.Blob,
     },
     env
   );
 
-  const envFetch = utils.hasOwnProp(env, 'fetch') ? env.fetch : undefined;
-  const { Request, Response, Blob } = env;
+  const { fetch: envFetch, Request, Response } = env;
   const isFetchSupported = envFetch ? fetch_isFunction(envFetch) : typeof fetch === 'function';
   const isRequestSupported = fetch_isFunction(Request);
   const isResponseSupported = fetch_isFunction(Response);
@@ -65265,20 +62950,6 @@ const factory = (env) => {
     isReadableStreamSupported &&
     test(() => utils.isReadableStream(new Response('').body));
 
-  // Some runtimes reject every explicit cache mode. Use own defaults for both
-  // probes so unrelated polluted options cannot affect cache-mode detection.
-  const requestDefaults = Object.assign(Object.create(null), DEFAULT_REQUEST_OPTIONS);
-
-  if (isRequestSupported && !test(() => new Request(lib_platform.origin, requestDefaults))) {
-    delete requestDefaults.cache;
-
-    // Only omit cache when that makes Request construction succeed. Otherwise
-    // retain the explicit default that protects supporting runtimes from pollution.
-    if (!test(() => new Request(lib_platform.origin, requestDefaults))) {
-      requestDefaults.cache = DEFAULT_REQUEST_OPTIONS.cache;
-    }
-  }
-
   const resolvers = {
     stream: supportsResponseStream && ((res) => res.body),
   };
@@ -65310,6 +62981,14 @@ const factory = (env) => {
 
     if (utils.isBlob(body)) {
       return body.size;
+    }
+
+    if (utils.isSpecCompliantForm(body)) {
+      const _request = new Request(lib_platform.origin, {
+        method: 'POST',
+        body,
+      });
+      return (await _request.arrayBuffer()).byteLength;
     }
 
     if (utils.isArrayBufferView(body) || utils.isArrayBuffer(body)) {
@@ -65347,7 +63026,6 @@ const factory = (env) => {
       fetchOptions,
       maxContentLength,
       maxBodyLength,
-      maxRedirects,
     } = helpers_resolveConfig(config);
 
     const hasMaxContentLength = utils.isNumber(maxContentLength) && maxContentLength > -1;
@@ -65374,12 +63052,11 @@ const factory = (env) => {
 
     let requestContentLength;
 
-    // AxiosErrors we raise while request or response bodies are being streamed. Captured
+    // AxiosError we raise while the request body is being streamed. Captured
     // by identity so the catch block can surface it directly, regardless of
     // how the runtime wraps the resulting fetch rejection (undici exposes it
     // as `err.cause`; some browsers drop the original error entirely).
     let pendingBodyError = null;
-    let pendingResponseError = null;
 
     const maxBodyLengthError = () =>
       new core_AxiosError(
@@ -65399,20 +63076,19 @@ const factory = (env) => {
         const password = utils.getSafeProp(configAuth, 'password') || '';
         auth = {
           username,
-          password,
+          password
         };
       }
 
-      let parsedURL;
       if (maybeWithAuthCredentials(url)) {
-        parsedURL = new URL(url, lib_platform.origin);
+        const parsedURL = new URL(url, lib_platform.origin);
 
         if (!auth && (parsedURL.username || parsedURL.password)) {
           const urlUsername = fetch_decodeURIComponentSafe(parsedURL.username);
           const urlPassword = fetch_decodeURIComponentSafe(parsedURL.password);
           auth = {
             username: urlUsername,
-            password: urlPassword,
+            password: urlPassword
           };
         }
 
@@ -65434,8 +63110,8 @@ const factory = (env) => {
       // Enforce maxContentLength for data: URLs up-front so we never materialize
       // an oversized payload. The HTTP adapter applies the same check (see http.js
       // "if (protocol === 'data:')" branch).
-      if (hasMaxContentLength && parsedURL && parsedURL.protocol === 'data:') {
-        const estimated = estimateDataURLDecodedBytes(parsedURL.href);
+      if (hasMaxContentLength && typeof url === 'string' && url.startsWith('data:')) {
+        const estimated = estimateDataURLDecodedBytes(url);
         if (estimated > maxContentLength) {
           throw new core_AxiosError(
             'maxContentLength size of ' + maxContentLength + ' exceeded',
@@ -65444,38 +63120,6 @@ const factory = (env) => {
             request
           );
         }
-      }
-
-      const formContentType =
-        utils.isSpecCompliantForm(data) && core_AxiosHeaders.from(own('headers')).getContentType();
-      let formBoundary;
-      if (
-        utils.isString(formContentType) &&
-        /^multipart\/form-data(?:\s*;|$)/i.test(formContentType.trim())
-      ) {
-        const parameters = core_AxiosHeaders.parseParameters(formContentType);
-        if (utils.hasOwnProp(parameters, 'boundary')) formBoundary = parameters.boundary;
-      }
-
-      if (
-        utils.isSpecCompliantForm(data) &&
-        method !== 'get' &&
-        method !== 'head' &&
-        (hasMaxBodyLength ||
-          (onUploadProgress && supportsRequestStream) ||
-          formBoundary !== undefined)
-      ) {
-        data = createMultipartBody(
-          data,
-          Blob,
-          hasMaxBodyLength ? maxBodyLength : Infinity,
-          maxBodyLengthError,
-          formBoundary
-        );
-        // Blob.type lowercases its value, including a case-sensitive boundary.
-        // Retain the caller's header when an explicit boundary was serialized.
-        headers.setContentType(formBoundary === undefined ? data.type : formContentType);
-        requestContentLength = data.size;
       }
 
       // Enforce maxBodyLength against known-size bodies before dispatch using
@@ -65518,9 +63162,7 @@ const factory = (env) => {
         (onUploadProgress || mustEnforceStreamBody)
       ) {
         requestContentLength =
-          requestContentLength == null
-            ? await resolveBodyLength(headers, data)
-            : requestContentLength;
+          requestContentLength == null ? await resolveBodyLength(headers, data) : requestContentLength;
 
         // A declared length of 0 is only trusted to skip the wrap when we are
         // not enforcing a stream limit (which must not rely on that header).
@@ -65533,10 +63175,7 @@ const factory = (env) => {
 
           let contentTypeHeader;
 
-          if (
-            utils.isFormData(data) &&
-            (contentTypeHeader = _request.headers.get('content-type'))
-          ) {
+          if (utils.isFormData(data) && (contentTypeHeader = _request.headers.get('content-type'))) {
             headers.setContentType(contentTypeHeader);
           }
 
@@ -65599,57 +63238,20 @@ const factory = (env) => {
       // Set User-Agent header if not already set (fetch defaults to 'node' in Node.js)
       headers.set('User-Agent', 'axios/' + data_VERSION, false);
 
-      const safeFetchOptions =
-        fetchOptions == null ? fetchOptions : Object.assign(Object.create(null), fetchOptions);
-
-      if (safeFetchOptions) {
-        // These options are owned by Axios and are already reflected in the
-        // resolved Request passed to fetch.
-        delete safeFetchOptions.body;
-        delete safeFetchOptions.headers;
-        delete safeFetchOptions.method;
-        delete safeFetchOptions.signal;
-        delete safeFetchOptions.duplex;
-        delete safeFetchOptions.credentials;
-      }
-
-      const resolvedOptions = Object.assign(Object.create(null), safeFetchOptions, {
+      const resolvedOptions = {
+        ...fetchOptions,
         signal: composedSignal,
         method: method.toUpperCase(),
         headers: toByteStringHeaderObject(headers.normalize()),
         body: data,
         duplex: 'half',
         credentials: isCredentialsSupported ? withCredentials : undefined,
-      });
-
-      if (isRequestSupported) {
-        utils.forEach(requestDefaults, (value, key) => {
-          if (resolvedOptions[key] === undefined) {
-            resolvedOptions[key] = value;
-          }
-        });
-
-        if (resolvedOptions.signal === undefined) {
-          resolvedOptions.signal = null;
-        }
-
-        if (resolvedOptions.body === undefined) {
-          resolvedOptions.body = null;
-        }
-      }
-
-      if (maxRedirects === 0) {
-        resolvedOptions.redirect = 'manual';
-
-        if (safeFetchOptions) {
-          safeFetchOptions.redirect = 'manual';
-        }
-      }
+      };
 
       request = isRequestSupported && new Request(url, resolvedOptions);
 
       let response = await (isRequestSupported
-        ? _fetch(request, safeFetchOptions)
+        ? _fetch(request, fetchOptions)
         : _fetch(url, resolvedOptions));
 
       const responseHeaders = core_AxiosHeaders.from(response.headers);
@@ -65697,12 +63299,12 @@ const factory = (env) => {
           if (hasMaxContentLength) {
             bytesRead = loadedBytes;
             if (bytesRead > maxContentLength) {
-              throw (pendingResponseError = new core_AxiosError(
+              throw new core_AxiosError(
                 'maxContentLength size of ' + maxContentLength + ' exceeded',
                 core_AxiosError.ERR_BAD_RESPONSE,
                 config,
                 request
-              ));
+              );
             }
           }
           onProgress && onProgress(loadedBytes);
@@ -65788,17 +63390,13 @@ const factory = (env) => {
       }
 
       // Surface a maxBodyLength violation we raised while the request body was
-      // being streamed. Keeping the original error (rather than reading
+      // being streamed. Matching by identity (rather than reading
       // `err.cause.isAxiosError`) keeps the error deterministic across runtimes
       // and avoids both prototype-pollution reads and mis-attributing a foreign
       // AxiosError that merely happened to land in `err.cause`.
       if (pendingBodyError) {
         request && !pendingBodyError.request && (pendingBodyError.request = request);
         throw pendingBodyError;
-      }
-
-      if (pendingResponseError) {
-        throw pendingResponseError;
       }
 
       // Re-throw AxiosErrors we raised synchronously (data: URL / content-length
@@ -65836,15 +63434,9 @@ const factory = (env) => {
 const seedCache = new Map();
 
 const getFetch = (config) => {
-  const env = Object.create(null);
-  const configuredEnv = config && utils.hasOwnProp(config, 'env') && config.env;
-  ['fetch', 'Request', 'Response', 'Blob'].forEach((key) => {
-    if (configuredEnv && utils.hasOwnProp(configuredEnv, key)) {
-      env[key] = configuredEnv[key];
-    }
-  });
-  const { fetch, Request, Response, Blob } = env;
-  const seeds = [Request, Response, fetch, Blob];
+  let env = (config && config.env) || {};
+  const { fetch, Request, Response } = env;
+  const seeds = [Request, Response, fetch];
 
   let len = seeds.length,
     i = len,
@@ -66012,7 +63604,6 @@ function getAdapter(adapters, config) {
 
 
 
-
 /**
  * Throws a `CanceledError` if cancellation has been requested.
  *
@@ -66031,52 +63622,16 @@ function throwIfCancellationRequested(config) {
 }
 
 /**
- * Resolve the clock used to time adapter execution.
- *
- * Prefers the monotonic `performance.now()` so wall-clock adjustments do not
- * skew the measurement, and so frameworks that forbid reading the current
- * time during prerendering (e.g. Next.js Cache Components) accept it. Falls
- * back to `Date.now()` in runtimes without the High Resolution Time API.
- *
- * @returns {() => number} Millisecond clock
- */
-function resolveClock() {
-  return typeof performance !== 'undefined' && utils.isFunction(performance.now)
-    ? () => performance.now()
-    : Date.now;
-}
-
-/**
- * Whole milliseconds elapsed since `start`, floored at zero.
- *
- * Rounded so the value stays an integer as with `Date.now()`. The fallback
- * wall clock can move backwards mid-request, so the result is clamped.
- *
- * @param {() => number} now Clock returned by `resolveClock()`
- * @param {number} start Timestamp read from `now`
- *
- * @returns {number} Non-negative elapsed milliseconds
- */
-function elapsedSince(now, start) {
-  return Math.max(0, Math.round(now() - start));
-}
-
-/**
  * Dispatch a request to the server using the configured adapter.
  *
  * @param {object} config The config that is to be used for the request
  *
  * @returns {Promise} The Promise to be fulfilled
  */
-function dispatchRequest(_config) {
-  // Interceptors may replace the merged config with an ordinary object. Flatten
-  // it at the dispatch boundary so shared prototype members cannot become
-  // request behavior, while preserving intentional template/class members.
-  const config = utils.toSafeFlatObject(_config);
-
+function dispatchRequest(config) {
   throwIfCancellationRequested(config);
 
-  config.headers = core_AxiosHeaders.from(utils.getSafeProp(config, 'headers'));
+  config.headers = core_AxiosHeaders.from(config.headers);
 
   // Transform request data
   config.data = transformData.call(config, config.transformRequest);
@@ -66087,14 +63642,9 @@ function dispatchRequest(_config) {
 
   const adapter = adapters.getAdapter(config.adapter || lib_defaults.adapter, config);
 
-  const now = resolveClock();
-  const start = now();
-
   return adapter(config).then(
     function onAdapterResolution(response) {
       throwIfCancellationRequested(config);
-
-      response.duration = elapsedSince(now, start);
 
       // Expose the current response on config so that transformResponse can
       // attach it to any AxiosError it throws (e.g. on JSON parse failure).
@@ -66116,7 +63666,6 @@ function dispatchRequest(_config) {
 
         // Transform response data
         if (reason && reason.response) {
-          reason.response.duration = elapsedSince(now, start);
           config.response = reason.response;
           try {
             reason.response.data = transformData.call(
@@ -66263,40 +63812,7 @@ function assertOptions(options, schema, allowUnknown) {
 
 
 
-
-
 const Axios_validators = validator.validators;
-
-// Recognize header maps without consuming objects intended as literal values.
-// AxiosHeaders from other builds share a brand and header-container interface,
-// but not constructor identity. A tag and toJSON alone can describe a literal.
-const isHeadersBucket = (value) => {
-  if (value == null || utils.isPlainObject(value) || value instanceof core_AxiosHeaders) {
-    return true;
-  }
-
-  try {
-    return (
-      utils.isObject(value) &&
-      utils.getSafeProp(value, Symbol.toStringTag) === 'AxiosHeaders' &&
-      [
-        'toJSON',
-        'set',
-        'get',
-        'has',
-        'delete',
-        'clear',
-        'normalize',
-        'concat',
-        'toString',
-        Symbol.iterator,
-      ].every((method) => utils.isFunction(utils.getSafeProp(value, method)))
-    );
-  } catch (e) {
-    // A failed optional brand probe must not prevent literal header serialization.
-    return false;
-  }
-};
 
 /**
  * Create a new instance of Axios
@@ -66327,47 +63843,37 @@ class Axios {
       return await this._request(configOrUrl, config);
     } catch (err) {
       if (err instanceof Error) {
-        try {
-          let dummy = {};
+        let dummy = {};
 
-          Error.captureStackTrace ? Error.captureStackTrace(dummy) : (dummy = new Error());
+        Error.captureStackTrace ? Error.captureStackTrace(dummy) : (dummy = new Error());
 
-          const dummyStack = dummy.stack;
-          let stack = '';
-
-          // slice off the Error: ... line
-          if (typeof dummyStack === 'string') {
-            const firstNewlineIndex = dummyStack.indexOf('\n');
-
-            stack = firstNewlineIndex === -1 ? '' : dummyStack.slice(firstNewlineIndex + 1);
+        // slice off the Error: ... line
+        const stack = (() => {
+          if (!dummy.stack) {
+            return '';
           }
 
+          const firstNewlineIndex = dummy.stack.indexOf('\n');
+
+          return firstNewlineIndex === -1 ? '' : dummy.stack.slice(firstNewlineIndex + 1);
+        })();
+        try {
           if (!err.stack) {
             err.stack = stack;
+            // match without the 2 top stack lines
           } else if (stack) {
-            // Match a common suffix after the 2 top frames when available,
-            // otherwise compare the full reconstructed stack.
             const firstNewlineIndex = stack.indexOf('\n');
             const secondNewlineIndex =
               firstNewlineIndex === -1 ? -1 : stack.indexOf('\n', firstNewlineIndex + 1);
-            const duplicateCheckSuffix =
-              secondNewlineIndex === -1 ? stack : stack.slice(secondNewlineIndex + 1);
+            const stackWithoutTwoTopLines =
+              secondNewlineIndex === -1 ? '' : stack.slice(secondNewlineIndex + 1);
 
-            // `AxiosError.from()` may have already inlined the wrapped error's
-            // stack under a `Caused by:` marker. Keep the reconstructed caller
-            // frames ahead of that marker so stack-only reporters do not read
-            // them as part of the low-level cause.
-            const currentStack = String(err.stack);
-            const causeIndex = getCauseStackIndex(err, currentStack);
-            const stackHead = causeIndex === -1 ? currentStack : currentStack.slice(0, causeIndex);
-            const causeSection = causeIndex === -1 ? '' : currentStack.slice(causeIndex);
-
-            if (!stackHead.endsWith(duplicateCheckSuffix)) {
-              err.stack = stackHead + '\n' + stack + causeSection;
+            if (!String(err.stack).endsWith(stackWithoutTwoTopLines)) {
+              err.stack += '\n' + stack;
             }
           }
         } catch (e) {
-          // Ignore failures from custom stack hooks or un-writable stack properties.
+          // ignore the case where "stack" is an un-writable property
         }
       }
 
@@ -66399,7 +63905,6 @@ class Axios {
           legacyInterceptorReqResOrdering: Axios_validators.transitional(Axios_validators.boolean),
           advertiseZstdAcceptEncoding: Axios_validators.transitional(Axios_validators.boolean),
           validateStatusUndefinedResolves: Axios_validators.transitional(Axios_validators.boolean),
-          encodeBasicAuthUsername: Axios_validators.transitional(Axios_validators.boolean),
         },
         false
       );
@@ -66425,10 +63930,7 @@ class Axios {
     // Set config.allowAbsoluteUrls
     if (config.allowAbsoluteUrls !== undefined) {
       // do nothing
-    } else if (
-      utils.hasOwnProp(this.defaults, 'allowAbsoluteUrls') &&
-      this.defaults.allowAbsoluteUrls !== undefined
-    ) {
+    } else if (this.defaults.allowAbsoluteUrls !== undefined) {
       config.allowAbsoluteUrls = this.defaults.allowAbsoluteUrls;
     } else {
       config.allowAbsoluteUrls = true;
@@ -66444,27 +63946,14 @@ class Axios {
     );
 
     // Set config.method
-    config.method = (
-      utils.getSafeProp(config, 'method') ||
-      utils.getSafeProp(this.defaults, 'method') ||
-      'get'
-    ).toLowerCase();
+    config.method = (config.method || this.defaults.method || 'get').toLowerCase();
 
-    // Flatten header defaults without consuming literal method-named headers.
-    const commonHeaders = utils.getSafeProp(headers, 'common');
-    const methodHeaders = utils.getSafeProp(headers, config.method);
-    const contextHeaders =
-      headers &&
-      utils.merge(
-        isHeadersBucket(commonHeaders) ? commonHeaders : undefined,
-        isHeadersBucket(methodHeaders) ? methodHeaders : undefined
-      );
+    // Flatten headers
+    let contextHeaders = headers && utils.merge(headers.common, headers[config.method]);
 
     headers &&
-      utils.forEach(core_methodList.concat('common'), (method) => {
-        if (isHeadersBucket(utils.getSafeProp(headers, method))) {
-          delete headers[method];
-        }
+      utils.forEach(['delete', 'get', 'head', 'post', 'put', 'patch', 'query', 'common'], (method) => {
+        delete headers[method];
       });
 
     config.headers = core_AxiosHeaders.concat(contextHeaders, headers);
@@ -66522,35 +64011,17 @@ class Axios {
       const onFulfilled = requestInterceptorChain[i++];
       const onRejected = requestInterceptorChain[i++];
       try {
-        newConfig = onFulfilled ? onFulfilled(newConfig) : newConfig;
+        newConfig = onFulfilled(newConfig);
       } catch (error) {
-        if (!onRejected) {
-          promise = Promise.reject(error);
-          break;
-        }
-
-        try {
-          const rejectedResult = onRejected.call(this, error);
-
-          if (utils.isThenable(rejectedResult)) {
-            promise = Promise.resolve(rejectedResult).then(() =>
-              dispatchRequest.call(this, newConfig)
-            );
-          }
-        } catch (rejectedError) {
-          promise = Promise.reject(rejectedError);
-        }
-
+        onRejected.call(this, error);
         break;
       }
     }
 
-    if (!promise) {
-      try {
-        promise = dispatchRequest.call(this, newConfig);
-      } catch (error) {
-        promise = Promise.reject(error);
-      }
+    try {
+      promise = dispatchRequest.call(this, newConfig);
+    } catch (error) {
+      return Promise.reject(error);
     }
 
     i = 0;
@@ -66573,7 +64044,7 @@ class Axios {
 // Provide aliases for supported request methods
 utils.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoData(method) {
   /*eslint func-names:0*/
-  Axios.prototype[method] = async function (url, config) {
+  Axios.prototype[method] = function (url, config) {
     return this.request(
       mergeConfig(config || {}, {
         method,
@@ -66586,7 +64057,7 @@ utils.forEach(['delete', 'get', 'head', 'options'], function forEachMethodNoData
 
 utils.forEach(['post', 'put', 'patch', 'query'], function forEachMethodWithData(method) {
   function generateHTTPMethod(isForm) {
-    return async function httpMethod(url, data, config) {
+    return function httpMethod(url, data, config) {
       return this.request(
         mergeConfig(config || {}, {
           method,
@@ -66834,22 +64305,14 @@ const HttpStatusCode = {
   Gone: 410,
   LengthRequired: 411,
   PreconditionFailed: 412,
-  /**
-   * @deprecated Use `ContentTooLarge` instead.
-   */
   PayloadTooLarge: 413,
-  ContentTooLarge: 413,
   UriTooLong: 414,
   UnsupportedMediaType: 415,
   RangeNotSatisfiable: 416,
   ExpectationFailed: 417,
   ImATeapot: 418,
   MisdirectedRequest: 421,
-  /**
-   * @deprecated Use `UnprocessableContent` instead.
-   */
   UnprocessableEntity: 422,
-  UnprocessableContent: 422,
   Locked: 423,
   FailedDependency: 424,
   TooEarly: 425,
@@ -66869,7 +64332,6 @@ const HttpStatusCode = {
   LoopDetected: 508,
   NotExtended: 510,
   NetworkAuthenticationRequired: 511,
-  WebServerReturnsAnUnknownError: 520,
   WebServerIsDown: 521,
   ConnectionTimedOut: 522,
   OriginIsUnreachable: 523,
@@ -66879,9 +64341,7 @@ const HttpStatusCode = {
 };
 
 Object.entries(HttpStatusCode).forEach(([key, value]) => {
-  if (HttpStatusCode[value] === undefined) {
-    HttpStatusCode[value] = key;
-  }
+  HttpStatusCode[value] = key;
 });
 
 /* harmony default export */ const helpers_HttpStatusCode = (HttpStatusCode);
@@ -77010,26 +74470,6 @@ class MatcherView {
   }
 
   /**
-   * Get the value of a "kept" attribute from the nearest ancestor (or
-   * current node) that declared it via `push(tag, attrs, ns, { keep: [...] })`.
-   * @param {string} attrName
-   * @returns {*}
-   */
-  getAnyParentAttr(attrName) {
-    return this._matcher.getAnyParentAttr(attrName);
-  }
-
-  /**
-   * Check whether any ancestor (or the current node) kept the given
-   * attribute via `push(tag, attrs, ns, { keep: [...] })`.
-   * @param {string} attrName
-   * @returns {boolean}
-   */
-  hasAnyParentAttr(attrName) {
-    return this._matcher.hasAnyParentAttr(attrName);
-  }
-
-  /**
    * Get current node's sibling position (child index in parent).
    * @returns {number}
    */
@@ -77137,9 +74577,6 @@ class Matcher {
     // Each siblingStacks entry: Map<tagName, count> tracking occurrences at each level
     this._pathStringCache = null;
     this._view = new MatcherView(this);
-
-    // Kept-attribute stack: only populated when push() is called with options.keep.
-    this._keptAttrs = [];
   }
 
   /**
@@ -77147,10 +74584,8 @@ class Matcher {
    * @param {string} tagName
    * @param {Object|null} [attrValues=null]
    * @param {string|null} [namespace=null]
-   * @param {Object|null} [options=null]
-   * @param {string[]} [options.keep] - Names of attributes (from attrValues)
    */
-  push(tagName, attrValues = null, namespace = null, options = null) {
+  push(tagName, attrValues = null, namespace = null) {
     this._pathStringCache = null;
 
     // Remove values from previous current node (now becoming ancestor)
@@ -77160,29 +74595,26 @@ class Matcher {
 
     // Get or create sibling tracking for current level
     const currentLevel = this.path.length;
-    let level = this.siblingStacks[currentLevel];
-    if (!level) {
-      // `counts` tells same-name siblings apart (the "counter" — nth <item>
-      // among other <item>s). `total` is every child seen at this level so
-      // far, kept as a running number instead of re-added from `counts` on
-      // every push — a parent with many differently-named children would
-      // otherwise cost more per child the more distinct names it has.
-      level = { counts: new Map(), total: 0 };
-      this.siblingStacks[currentLevel] = level;
+    if (!this.siblingStacks[currentLevel]) {
+      this.siblingStacks[currentLevel] = new Map();
     }
+
+    const siblings = this.siblingStacks[currentLevel];
 
     // Create a unique key for sibling tracking that includes namespace
     const siblingKey = namespace ? `${namespace}:${tagName}` : tagName;
 
     // Calculate counter (how many times this tag appeared at this level)
-    const counter = level.counts.get(siblingKey) || 0;
+    const counter = siblings.get(siblingKey) || 0;
 
-    // Position = total children at this level seen before this one.
-    const position = level.total;
+    // Calculate position (total children at this level so far)
+    let position = 0;
+    for (const count of siblings.values()) {
+      position += count;
+    }
 
-    // Update sibling count for this tag, and the level's running total.
-    level.counts.set(siblingKey, counter + 1);
-    level.total++;
+    // Update sibling count for this tag
+    siblings.set(siblingKey, counter + 1);
 
     // Create new node
     const node = {
@@ -77200,24 +74632,6 @@ class Matcher {
     }
 
     this.path.push(node);
-
-    // Depth of the node we just pushed (1-based, matches this.path.length)
-    const depth = this.path.length;
-
-    // Copy only the requested attributes into the kept-attrs stack. This is
-    // the one part of push() whose cost scales with input (O(keep.length))
-    // rather than being O(1) — by design, since the caller is explicitly
-    // opting in for specific attribute names. No options/keep => zero added
-    // cost beyond the two property reads below.
-    const keep = options !== null ? options.keep : null;
-    if (keep !== null && keep !== undefined && keep.length > 0 && attrValues) {
-      for (let i = 0; i < keep.length; i++) {
-        const name = keep[i];
-        if (attrValues[name] !== undefined) {
-          this._keptAttrs.push({ depth, name, value: attrValues[name] });
-        }
-      }
-    }
   }
 
   /**
@@ -77232,18 +74646,6 @@ class Matcher {
 
     if (this.siblingStacks.length > this.path.length + 1) {
       this.siblingStacks.length = this.path.length + 1;
-    }
-
-    // Drop any kept attributes that belonged to the popped node (or deeper).
-    // _keptAttrs is depth-ordered (push only ever appends increasing depths),
-    // so this is a backward scan that stops at the first surviving entry —
-    // typically O(1) since kept attrs are rare by design.
-    const poppedDepth = this.path.length + 1;
-    while (
-      this._keptAttrs.length > 0 &&
-      this._keptAttrs[this._keptAttrs.length - 1].depth >= poppedDepth
-    ) {
-      this._keptAttrs.pop();
     }
 
     return node;
@@ -77298,38 +74700,6 @@ class Matcher {
     if (this.path.length === 0) return false;
     const current = this.path[this.path.length - 1];
     return current.values !== undefined && attrName in current.values;
-  }
-
-  /**
-   * Get the value of a "kept" attribute from the nearest ancestor (or
-   * current node) that declared it via `push(tag, attrs, ns, { keep: [...] })`.
-   * Unlike getAttrValue(), this works regardless of how deep the path has
-   * gone since the attribute was pushed — but only for attribute names that
-   * were explicitly marked with `keep` at push time. Cost is proportional to
-   * the number of currently-kept attributes (typically 0-3), not path depth.
-   * @param {string} attrName
-   * @returns {*} the value, or undefined if no ancestor kept this attribute
-   */
-  getAnyParentAttr(attrName) {
-    const kept = this._keptAttrs;
-    for (let i = kept.length - 1; i >= 0; i--) {
-      if (kept[i].name === attrName) return kept[i].value;
-    }
-    return undefined;
-  }
-
-  /**
-   * Check whether any ancestor (or the current node) kept the given
-   * attribute via `push(tag, attrs, ns, { keep: [...] })`.
-   * @param {string} attrName
-   * @returns {boolean}
-   */
-  hasAnyParentAttr(attrName) {
-    const kept = this._keptAttrs;
-    for (let i = kept.length - 1; i >= 0; i--) {
-      if (kept[i].name === attrName) return true;
-    }
-    return false;
   }
 
   /**
@@ -77408,7 +74778,6 @@ class Matcher {
     this._pathStringCache = null;
     this.path = [];
     this.siblingStacks = [];
-    this._keptAttrs = [];
   }
 
   /**
@@ -77558,8 +74927,7 @@ class Matcher {
   snapshot() {
     return {
       path: this.path.map(node => ({ ...node })),
-      siblingStacks: this.siblingStacks.map(level => level ? { counts: new Map(level.counts), total: level.total } : level),
-      keptAttrs: this._keptAttrs.map(entry => ({ ...entry }))
+      siblingStacks: this.siblingStacks.map(map => new Map(map))
     };
   }
 
@@ -77570,8 +74938,7 @@ class Matcher {
   restore(snapshot) {
     this._pathStringCache = null;
     this.path = snapshot.path.map(node => ({ ...node }));
-    this.siblingStacks = snapshot.siblingStacks.map(level => level ? { counts: new Map(level.counts), total: level.total } : level);
-    this._keptAttrs = (snapshot.keptAttrs || []).map(entry => ({ ...entry }));
+    this.siblingStacks = snapshot.siblingStacks.map(map => new Map(map));
   }
 
   /**
@@ -77594,30 +74961,22 @@ class Matcher {
     return this._view;
   }
 }
-
 ;// CONCATENATED MODULE: ./node_modules/fast-xml-builder/src/util.js
 
 
-// String(val)/val.toString() drop the sign of -0 (e.g. String(-0) === '0'), silently
-// corrupting a round-tripped negative-zero value. XML has no separate int/float syntax,
-// so this is the single place every raw value gets turned into text.
-function valToStr(val) {
-  return typeof val === 'number' && Object.is(val, -0) ? '-0' : String(val)
-}
-
 function safeComment(val) {
-  return valToStr(val)
+  return String(val)
     .replace(/--/g, '- -')   // -- is illegal anywhere in comment content
     .replace(/--/g, '- -')   // handle the scenario when 2 consiucative dashes appears 
     .replace(/-$/, '- ');    // trailing - would form -- with the closing -->
 }
 
 function safeCdata(val) {
-  return valToStr(val).replace(/\]\]>/g, ']]]]><![CDATA[>')
+  return String(val).replace(/\]\]>/g, ']]]]><![CDATA[>')
 }
 
 function escapeAttribute(val) {
-  return valToStr(val).replace(/"/g, '&quot;').replace(/'/g, '&apos;')
+  return String(val).replace(/"/g, '&quot;').replace(/'/g, '&apos;')
 }
 ;// CONCATENATED MODULE: ./node_modules/xml-naming/src/index.js
 /**
@@ -77732,36 +75091,8 @@ const buildRegexes = (startChar, char, flags = '') => {
 const regexes10 = buildRegexes(nameStartChar10, nameChar10);       // no /u — BMP only
 const regexes11 = buildRegexes(nameStartChar11, nameChar11, 'u');  // /u — enables \u{10000}-\u{EFFFF}
 
-// ---------------------------------------------------------------------------
-// ASCII-only fast path (opt-in, off by default)
-//
-// The XML 1.0 vs 1.1 NameStartChar/NameChar productions differ *only* in
-// their non-ASCII ranges (merged vs split Latin-1 ranges, \u0487, and
-// supplementary planes). Restricted to ASCII, both versions collapse to the
-// same character classes, so a single regex pair covers both xmlVersion
-// values — no /u flag needed.
-//
-// Rationale: unicode-aware regexes (the /u flag, required for XML 1.1's
-// supplementary-plane range) are measurably slower in V8 than plain
-// non-unicode regexes on the same input, even when the input is pure ASCII.
-// For the common case — HTML/SVG ids, XML tags — names are ASCII, so callers
-// who know this can opt in to skip the unicode-aware matching path entirely.
-// This is a real but *conditional* win: mainly for XML 1.1 input (avoids /u),
-// or at scale where the larger unicode character classes add engine
-// overhead. It also changes behaviour (rejects legitimate non-ASCII XML
-// 1.0/1.1 names), so it must never be silently enabled — hence off by
-// default.
-// ---------------------------------------------------------------------------
-
-const nameStartCharAscii = ':A-Za-z_';
-const nameCharAscii = nameStartCharAscii + '\\-\\.\\d';
-
-const regexesAscii = buildRegexes(nameStartCharAscii, nameCharAscii); // no /u — ASCII only
-
-const getRegexes = (xmlVersion = '1.0', asciiOnly = false) => {
-  if (asciiOnly) return regexesAscii;
-  return xmlVersion === '1.1' ? regexes11 : regexes10;
-};
+const getRegexes = (xmlVersion = '1.0') =>
+  xmlVersion === '1.1' ? regexes11 : regexes10;
 
 // ---------------------------------------------------------------------------
 // Boolean validators
@@ -77771,131 +75102,57 @@ const getRegexes = (xmlVersion = '1.0', asciiOnly = false) => {
  * Returns true if the string is a valid XML Name.
  * Colons are allowed anywhere (Name production).
  * Used for: DOCTYPE entity names, notation names, DTD element declarations.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const src_name = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  getRegexes(xmlVersion, asciiOnly).name.test(str);
+const src_name = (str, { xmlVersion = '1.0' } = {}) =>
+  getRegexes(xmlVersion).name.test(str);
 
 /**
  * Returns true if the string is a valid NCName (Non-Colonized Name).
  * Colons are not permitted.
  * Used for: namespace prefixes, local names, SVG id attributes.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const ncName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  getRegexes(xmlVersion, asciiOnly).ncName.test(str);
+const ncName = (str, { xmlVersion = '1.0' } = {}) =>
+  getRegexes(xmlVersion).ncName.test(str);
 
 /**
  * Returns true if the string is a valid QName (Qualified Name).
  * Allows exactly one colon as a prefix separator: prefix:localName.
  * Used for: element and attribute names in namespace-aware XML/SVG.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const qName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  getRegexes(xmlVersion, asciiOnly).qName.test(str);
+const qName = (str, { xmlVersion = '1.0' } = {}) =>
+  getRegexes(xmlVersion).qName.test(str);
 
 /**
  * Returns true if the string is a valid NMToken.
  * Like Name but no restriction on the first character.
  * Used for: DTD NMTOKEN attribute values.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const nmToken = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  getRegexes(xmlVersion, asciiOnly).nmToken.test(str);
+const nmToken = (str, { xmlVersion = '1.0' } = {}) =>
+  getRegexes(xmlVersion).nmToken.test(str);
 
 /**
  * Returns true if the string is a valid NMTokens value.
  * A whitespace-separated list of NMToken values.
  * Used for: DTD NMTOKENS attribute values.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const nmTokens = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  getRegexes(xmlVersion, asciiOnly).nmTokens.test(str);
-
-// ---------------------------------------------------------------------------
-// Memoized validator factory
-//
-// Real documents reuse a small vocabulary of tag/attribute names across many
-// siblings (e.g. `id`, `class`, `href` repeated across hundreds of elements).
-// The plain boolean validators above re-run the regex on every call
-// regardless of repeats. `createValidator` returns a closure with a private
-// string -> boolean cache, so repeated names after the first become O(1)
-// lookups instead of regex tests.
-//
-// - opts (xmlVersion, asciiOnly) are fixed at creation time, so the regex is
-//   resolved once, not on every call.
-// - The cache is private to the returned closure — no shared/global state,
-//   no cross-caller pollution.
-// - `maxCacheSize` bounds memory: once the cache reaches this many entries,
-//   it stops accepting new ones (existing entries keep serving hits; new
-//   misses just fall through to the regex, uncached). This avoids unbounded
-//   growth against adversarial/high-cardinality input (e.g. validating
-//   attacker-supplied names with no repeats) without the cost/complexity of
-//   a full LRU, and without the perf cliff of reset-and-refill thrashing.
-// - Call `.reset()` on the returned function to clear the cache manually
-//   (e.g. between unrelated parse calls).
-// ---------------------------------------------------------------------------
-
-const PRODUCTIONS = ['name', 'ncName', 'qName', 'nmToken', 'nmTokens'];
-
-/**
- * Returns a memoized boolean validator function for a single production,
- * with opts fixed at creation time.
- *
- * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean, maxCacheSize?: number }} [opts]
- *   maxCacheSize: max number of distinct strings to cache (default 2048).
- *   Once reached, new strings are validated but not cached; existing cached
- *   entries keep being served.
- * @returns {((str: string) => boolean) & { reset: () => void }}
- */
-const createValidator = (production, { xmlVersion = '1.0', asciiOnly = false, maxCacheSize = 2048 } = {}) => {
-  if (!PRODUCTIONS.includes(production)) {
-    throw new TypeError(
-      `Unknown production "${production}". Must be one of: ${PRODUCTIONS.join(', ')}`
-    );
-  }
-
-  const regex = getRegexes(xmlVersion, asciiOnly)[production];
-  let cache = new Map();
-
-  const validator = (str) => {
-    const cached = cache.get(str);
-    if (cached !== undefined) return cached;
-
-    const result = regex.test(str);
-    if (cache.size < maxCacheSize) cache.set(str, result);
-    return result;
-  };
-
-  validator.reset = () => { cache = new Map(); };
-
-  return validator;
-};
+const nmTokens = (str, { xmlVersion = '1.0' } = {}) =>
+  getRegexes(xmlVersion).nmTokens.test(str);
 
 // ---------------------------------------------------------------------------
 // Diagnostic validator
 // ---------------------------------------------------------------------------
+
+const PRODUCTIONS = (/* unused pure expression or super */ null && (['name', 'ncName', 'qName', 'nmToken', 'nmTokens']));
 
 /**
  * Validates a string against a named production and returns a detailed result.
  *
  * @param {string} str
  * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ * @param {{ xmlVersion?: '1.0'|'1.1' }} [opts]
  * @returns {{ valid: boolean, production: string, input: string, reason?: string, position?: number }}
  */
-const validate = (str, production, { xmlVersion = '1.0', asciiOnly = false } = {}) => {
+const validate = (str, production, { xmlVersion = '1.0' } = {}) => {
   if (!PRODUCTIONS.includes(production)) {
     throw new TypeError(
       `Unknown production "${production}". Must be one of: ${PRODUCTIONS.join(', ')}`
@@ -77903,19 +75160,12 @@ const validate = (str, production, { xmlVersion = '1.0', asciiOnly = false } = {
   }
 
   const validators = { name: src_name, ncName, qName, nmToken, nmTokens };
-  const isValid = validators[production](str, { xmlVersion, asciiOnly });
+  const isValid = validators[production](str, { xmlVersion });
 
   if (isValid) return { valid: true, production, input: str };
 
   let reason = 'Does not match the production rules';
   let position;
-
-  // Diagnostic fallback char checks must mirror the same character set the
-  // boolean validator above used, or the reported reason/position could
-  // contradict the `valid: false` result (e.g. flagging a char as illegal
-  // that the unicode-aware check would have accepted).
-  const startCharPattern = asciiOnly ? /^[:A-Za-z_]/ : /^[:A-Za-z_\u00C0-\uFFFD]/;
-  const namePattern = asciiOnly ? /[\w\-\\.:]/ : /[\w\-\\.:\u00B7\u00C0-\uFFFD]/;
 
   if (str.length === 0) {
     reason = 'Input is empty';
@@ -77933,13 +75183,13 @@ const validate = (str, production, { xmlVersion = '1.0', asciiOnly = false } = {
     position = str.lastIndexOf(':');
   } else if (
     ['name', 'ncName', 'qName'].includes(production) &&
-    !startCharPattern.test(str[0])
+    !/^[:A-Za-z_\u00C0-\uFFFD]/.test(str[0])
   ) {
     reason = `First character "${str[0]}" is not a valid NameStartChar`;
     position = 0;
   } else {
     for (let i = 0; i < str.length; i++) {
-      if (!namePattern.test(str[i])) {
+      if (!/[\w\-\\.:\u00B7\u00C0-\uFFFD]/.test(str[i])) {
         reason = `Character "${str[i]}" at position ${i} is not a valid NameChar`;
         position = i;
         break;
@@ -77959,7 +75209,7 @@ const validate = (str, production, { xmlVersion = '1.0', asciiOnly = false } = {
  *
  * @param {string[]} strings
  * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ * @param {{ xmlVersion?: '1.0'|'1.1' }} [opts]
  * @returns {Array<{ valid: boolean, production: string, input: string, reason?: string, position?: number }>}
  */
 const validateAll = (strings, production, opts = {}) =>
@@ -77974,12 +75224,10 @@ const validateAll = (strings, production, opts = {}) =>
  *
  * @param {string} str
  * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ replacement?: string, asciiOnly?: boolean }} [opts]
- *   asciiOnly: also replace any non-ASCII character, not just XML-illegal
- *   ones (default false).
+ * @param {{ replacement?: string }} [opts]
  * @returns {string}
  */
-const sanitize = (str, production = 'name', { replacement = '_', asciiOnly = false } = {}) => {
+const sanitize = (str, production = 'name', { replacement = '_' } = {}) => {
   if (!str) return replacement;
 
   let result = str;
@@ -77990,8 +75238,7 @@ const sanitize = (str, production = 'name', { replacement = '_', asciiOnly = fal
   }
 
   // Replace illegal characters
-  const allowedCharPattern = asciiOnly ? /[^\w\-\.:]/g : /[^\w\-\.:\u00B7\u00C0-\uFFFD]/g;
-  result = result.replace(allowedCharPattern, replacement);
+  result = result.replace(/[^\w\-\.:\u00B7\u00C0-\uFFFD]/g, replacement);
 
   // Fix invalid start character for Name / NCName / QName
   if (production !== 'nmToken' && production !== 'nmTokens') {
@@ -78041,11 +75288,11 @@ function detectXmlVersionFromArray(jArray, options) {
  * @param {boolean} isAttribute - true when resolving an attribute name
  * @param {object}  options
  * @param {Matcher} matcher     - current matcher state (readonly from callback perspective)
- * @param {function} qNameValidator - function to validate tag names
+ * @param {string}  xmlVersion  - '1.0' or '1.1', forwarded to xml-naming
  */
-function resolveTagName(name, isAttribute, options, matcher, qNameValidator) {
+function resolveTagName(name, isAttribute, options, matcher, xmlVersion) {
     if (!options.sanitizeName) return name;
-    if (qNameValidator(name)) return name;
+    if (qName(name, { xmlVersion })) return name;
     return options.sanitizeName(name, { isAttribute, matcher: matcher.readOnly() });
 }
 
@@ -78075,14 +75322,14 @@ function toXml(jArray, options) {
 
     // Detect XML version for use in name validation
     const xmlVersion = detectXmlVersionFromArray(jArray, options);
-    const qNameValidator = createValidator('qName', { xmlVersion });
+
     // Initialize matcher for path tracking
     const matcher = new Matcher();
 
-    return arrToStr(jArray, options, indentation, matcher, stopNodeExpressions, qNameValidator);
+    return arrToStr(jArray, options, indentation, matcher, stopNodeExpressions, xmlVersion);
 }
 
-function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qNameValidator) {
+function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, xmlVersion) {
     let xmlStr = "";
     let isPreviousElementTag = false;
 
@@ -78093,7 +75340,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qName
     if (!Array.isArray(arr)) {
         // Non-array values (e.g. string tag values) should be treated as text content
         if (arr !== undefined && arr !== null) {
-            let text = valToStr(arr);
+            let text = arr.toString();
             text = replaceEntitiesValue(text, options);
             return text;
         }
@@ -78115,7 +75362,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qName
         // Resolve tag name (may transform it; may throw for invalid names)
         const tagName = isSpecialName
             ? rawTagName
-            : resolveTagName(rawTagName, false, options, matcher, qNameValidator);
+            : resolveTagName(rawTagName, false, options, matcher, xmlVersion);
 
         // Extract attributes from ":@" property
         const attrValues = extractAttributeValues(tagObj[":@"], options);
@@ -78132,7 +75379,6 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qName
                 tagText = options.tagValueProcessor(tagName, tagText);
                 tagText = replaceEntitiesValue(tagText, options);
             }
-            tagText = valToStr(tagText);
             if (isPreviousElementTag) {
                 xmlStr += indentation;
             }
@@ -78158,7 +75404,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qName
             matcher.pop();
             continue;
         } else if (tagName[0] === "?") {
-            const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, qNameValidator);
+            const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, xmlVersion);
             const tempInd = tagName === "?xml" ? "" : indentation;
             // Text node content on PI/XML declaration tags is intentionally ignored.
             // Only attributes are valid on these tags per the XML spec.
@@ -78174,7 +75420,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qName
         }
 
         // Pass isStopNode to attr_to_str so attributes are also not processed for stopNodes
-        const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, qNameValidator);
+        const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, xmlVersion);
         const tagStart = indentation + `<${tagName}${attStr}`;
 
         // If this is a stopNode, get raw content without processing
@@ -78182,7 +75428,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qName
         if (isStopNode) {
             tagValue = orderedJs2Xml_getRawContent(tagObj[rawTagName], options);
         } else {
-            tagValue = arrToStr(tagObj[rawTagName], options, newIdentation, matcher, stopNodeExpressions, qNameValidator);
+            tagValue = arrToStr(tagObj[rawTagName], options, newIdentation, matcher, stopNodeExpressions, xmlVersion);
         }
 
         if (options.unpairedTags.indexOf(tagName) !== -1) {
@@ -78241,7 +75487,7 @@ function orderedJs2Xml_getRawContent(arr, options) {
     if (!Array.isArray(arr)) {
         // Non-array values return as-is
         if (arr !== undefined && arr !== null) {
-            return valToStr(arr);
+            return arr.toString();
         }
         return "";
     }
@@ -78253,7 +75499,7 @@ function orderedJs2Xml_getRawContent(arr, options) {
 
         if (tagName === options.textNodeName) {
             // Raw text content - NO processing, NO entity replacement
-            content += valToStr(item[tagName]);
+            content += item[tagName];
         } else if (tagName === options.cdataPropName) {
             // CDATA content
             content += item[tagName][0][options.textNodeName];
@@ -78311,7 +75557,7 @@ function propName(obj) {
  * Build attribute string, resolving attribute names through sanitizeName when configured.
  * Accepts matcher so the callback has path context.
  */
-function attr_to_str(attrMap, options, isStopNode, matcher, qNameValidator) {
+function attr_to_str(attrMap, options, isStopNode, matcher, xmlVersion) {
     let attrStr = "";
     if (attrMap && !options.ignoreAttributes) {
         for (let attr in attrMap) {
@@ -78321,7 +75567,7 @@ function attr_to_str(attrMap, options, isStopNode, matcher, qNameValidator) {
             const cleanAttrName = attr.substr(options.attributeNamePrefix.length);
             const resolvedAttrName = isStopNode
                 ? cleanAttrName  // stopNodes are raw — skip sanitizeName for attr names too
-                : resolveTagName(cleanAttrName, true, options, matcher, qNameValidator);
+                : resolveTagName(cleanAttrName, true, options, matcher, xmlVersion);
 
             let attrVal;
             if (isStopNode) {
@@ -78515,11 +75761,11 @@ function detectXmlVersionFromObj(jObj, options) {
  * @param {boolean} isAttribute - true when resolving an attribute name
  * @param {object}  options
  * @param {Matcher} matcher     - current matcher state (readonly from callback perspective)
- * @param {function} qNameValidator - function to validate tag names
+ * @param {string}  xmlVersion  - '1.0' or '1.1', forwarded to xml-naming
  */
-function fxb_resolveTagName(name, isAttribute, options, matcher, qNameValidator) {
+function fxb_resolveTagName(name, isAttribute, options, matcher, xmlVersion) {
   if (!options.sanitizeName) return name;
-  if (qNameValidator(name)) return name;
+  if (qName(name, { xmlVersion })) return name;
   return options.sanitizeName(name, { isAttribute, matcher: matcher.readOnly() });
 }
 
@@ -78535,12 +75781,11 @@ Builder.prototype.build = function (jObj) {
     // Initialize matcher for path tracking
     const matcher = new Matcher();
     const xmlVersion = detectXmlVersionFromObj(jObj, this.options);
-    const qNameValidator = createValidator('qName', { xmlVersion });
-    return this.j2x(jObj, 0, matcher, qNameValidator).val;
+    return this.j2x(jObj, 0, matcher, xmlVersion).val;
   }
 };
 
-Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
+Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
   let attrStr = '';
   let val = '';
   if (this.options.maxNestedTags && matcher.getDepth() >= this.options.maxNestedTags) {
@@ -78568,7 +75813,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
 
     const resolvedKey = isSpecialKey
       ? key
-      : fxb_resolveTagName(key, false, this.options, matcher, qNameValidator);
+      : fxb_resolveTagName(key, false, this.options, matcher, xmlVersion);
 
     if (typeof jObj[key] === 'undefined') {
       // supress undefined node only if it is not an attribute
@@ -78593,12 +75838,12 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
       const attr = this.isAttribute(key);
       if (attr && !this.ignoreAttributesFn(attr, jPath)) {
         // Resolve the attribute name through sanitizeName
-        const resolvedAttr = fxb_resolveTagName(attr, true, this.options, matcher, qNameValidator);
-        attrStr += this.buildAttrPairStr(resolvedAttr, valToStr(jObj[key]), isCurrentStopNode);
+        const resolvedAttr = fxb_resolveTagName(attr, true, this.options, matcher, xmlVersion);
+        attrStr += this.buildAttrPairStr(resolvedAttr, '' + jObj[key], isCurrentStopNode);
       } else if (!attr) {
         //tag value
         if (key === this.options.textNodeName) {
-          let newval = this.options.tagValueProcessor(key, valToStr(jObj[key]));
+          let newval = this.options.tagValueProcessor(key, '' + jObj[key]);
           val += this.replaceEntitiesValue(newval);
         } else {
           // Check if this is a stopNode before building
@@ -78608,7 +75853,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
 
           if (isStopNode) {
             // Build as raw content without encoding
-            const textValue = valToStr(jObj[key]);
+            const textValue = '' + jObj[key];
             if (textValue === '') {
               val += this.indentate(level) + '<' + resolvedKey + this.closeTag(resolvedKey) + this.tagEndChar;
             } else {
@@ -78635,7 +75880,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
           if (this.options.oneListGroup) {
             // Push tag to matcher before recursive call
             matcher.push(resolvedKey);
-            const result = this.j2x(item, level + 1, matcher, qNameValidator);
+            const result = this.j2x(item, level + 1, matcher, xmlVersion);
             // Pop tag from matcher after recursive call
             matcher.pop();
 
@@ -78644,13 +75889,12 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
               listTagAttr += result.attrStr
             }
           } else {
-            listTagVal += this.processTextOrObjNode(item, resolvedKey, level, matcher, qNameValidator)
+            listTagVal += this.processTextOrObjNode(item, resolvedKey, level, matcher, xmlVersion)
           }
         } else {
           if (this.options.oneListGroup) {
             let textValue = this.options.tagValueProcessor(resolvedKey, item);
             textValue = this.replaceEntitiesValue(textValue);
-            textValue = valToStr(textValue);
             listTagVal += textValue;
           } else {
             // Check if this is a stopNode before building
@@ -78660,7 +75904,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
 
             if (isStopNode) {
               // Build as raw content without encoding
-              const textValue = valToStr(item);
+              const textValue = '' + item;
               if (textValue === '') {
                 listTagVal += this.indentate(level) + '<' + resolvedKey + this.closeTag(resolvedKey) + this.tagEndChar;
               } else {
@@ -78683,11 +75927,11 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
         const L = Ks.length;
         for (let j = 0; j < L; j++) {
           // Resolve attribute names inside attributesGroupName
-          const resolvedAttr = fxb_resolveTagName(Ks[j], true, this.options, matcher, qNameValidator);
-          attrStr += this.buildAttrPairStr(resolvedAttr, valToStr(jObj[key][Ks[j]]), isCurrentStopNode);
+          const resolvedAttr = fxb_resolveTagName(Ks[j], true, this.options, matcher, xmlVersion);
+          attrStr += this.buildAttrPairStr(resolvedAttr, '' + jObj[key][Ks[j]], isCurrentStopNode);
         }
       } else {
-        val += this.processTextOrObjNode(jObj[key], resolvedKey, level, matcher, qNameValidator)
+        val += this.processTextOrObjNode(jObj[key], resolvedKey, level, matcher, xmlVersion)
       }
     }
   }
@@ -78696,7 +75940,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
 
 Builder.prototype.buildAttrPairStr = function (attrName, val, isStopNode) {
   if (!isStopNode) {
-    val = this.options.attributeValueProcessor(attrName, valToStr(val));
+    val = this.options.attributeValueProcessor(attrName, '' + val);
     val = this.replaceEntitiesValue(val);
   }
   if (this.options.suppressBooleanAttributes && val === "true") {
@@ -78704,7 +75948,7 @@ Builder.prototype.buildAttrPairStr = function (attrName, val, isStopNode) {
   } else return ' ' + attrName + '="' + escapeAttribute(val) + '"';
 }
 
-function processTextOrObjNode(object, key, level, matcher, qNameValidator) {
+function processTextOrObjNode(object, key, level, matcher, xmlVersion) {
   // Extract attributes to pass to matcher
   const attrValues = this.extractAttributes(object);
 
@@ -78722,7 +75966,7 @@ function processTextOrObjNode(object, key, level, matcher, qNameValidator) {
     return this.buildObjectNode(rawContent, key, attrStr, level);
   }
 
-  const result = this.j2x(object, level + 1, matcher, qNameValidator);
+  const result = this.j2x(object, level + 1, matcher, xmlVersion);
   // Pop tag from matcher after recursion
   matcher.pop();
 
@@ -78851,9 +76095,7 @@ Builder.prototype.buildAttributesForStopNode = function (obj) {
       if (val === true && this.options.suppressBooleanAttributes) {
         attrStr += ' ' + cleanKey;
       } else {
-        // stopNode content is raw, but the quote delimiter is always escaped
-        // so a quote in the value cannot break out of the attribute (see orderedJs2Xml attr_to_str)
-        attrStr += ' ' + cleanKey + '="' + escapeAttribute(val) + '"';
+        attrStr += ' ' + cleanKey + '="' + val + '"'; // No encoding for stopNode
       }
     }
   } else {
@@ -78866,9 +76108,7 @@ Builder.prototype.buildAttributesForStopNode = function (obj) {
         if (val === true && this.options.suppressBooleanAttributes) {
           attrStr += ' ' + attr;
         } else {
-          // stopNode content is raw, but the quote delimiter is always escaped
-          // so a quote in the value cannot break out of the attribute (see orderedJs2Xml attr_to_str)
-          attrStr += ' ' + attr + '="' + escapeAttribute(val) + '"';
+          attrStr += ' ' + attr + '="' + val + '"'; // No encoding for stopNode
         }
       }
     }
@@ -78899,7 +76139,7 @@ Builder.prototype.buildObjectNode = function (val, key, attrStr, level) {
     if ((attrStr || attrStr === '') && val.indexOf('<') === -1) {
       return (this.indentate(level) + '<' + key + attrStr + piClosingChar + '>' + val + tagEndExp);
     } else if (this.options.commentPropName !== false && key === this.options.commentPropName && piClosingChar.length === 0) {
-      return this.indentate(level) + `<!--${safeComment(val)}-->` + this.newLine;
+      return this.indentate(level) + `<!--${val}-->` + this.newLine;
     } else {
       return (
         this.indentate(level) + '<' + key + attrStr + piClosingChar + this.tagEndChar +
@@ -78956,10 +76196,6 @@ Builder.prototype.buildTextValNode = function (val, key, attrStr, level, matcher
     // Normal processing: apply tagValueProcessor and entity replacement
     let textValue = this.options.tagValueProcessor(key, val);
     textValue = this.replaceEntitiesValue(textValue);
-    // tagValueProcessor may return the raw value unchanged (default is identity), and
-    // replaceEntitiesValue no-ops on non-strings, so a plain number can still reach here;
-    // stringify it now, sign-preserving, before it's implicitly ToString'd below.
-    textValue = valToStr(textValue);
 
     if (textValue === '') {
       return this.indentate(level) + '<' + key + attrStr + this.closeTag(key) + this.tagEndChar;
@@ -79374,102 +76610,9 @@ function readAttributeStr(xmlData, i) {
 }
 
 /**
- * Walk `attrStr` once, left to right, splitting it into attribute tokens.
- *
- * This replaces a regex that used to do the same job
- * (`(\s*)([^\s=]+)(\s*=)?(\s*(['"])(([\s\S])*?)\5)?`). That regex led with an
- * optional whitespace group followed by a required "non-whitespace" group.
- * On a long run of whitespace that never resolves into an attribute name
- * (e.g. a tag with thousands of trailing spaces before `>`), the engine
- * backtracks the whitespace group one character at a time before giving up
- * and moving to the next starting position — one full backtrack per
- * position, which is quadratic in the length of the run.
- *
- * A single forward-only scan can never backtrack, so it can't be made slow
- * this way no matter how much whitespace the input contains — it's always
- * proportional to the length of the string, once.
- *
- * Each returned token mirrors the shape the old regex match array had, so
- * the validation logic below (which reads token[1]..token[6]) didn't need
- * to change:
- *   token.startIndex - where this token begins in attrStr
- *   token[1]          - leading whitespace before the name
- *   token[2]          - the attribute name
- *   token[3]          - whitespace + '=' if present, else undefined
- *   token[4]          - marker (any defined value) if a quoted value was found
- *   token[5]          - the quote character used ('"' or "'")
- *   token[6]          - the value's text, without the surrounding quotes
- *
- * A malformed leading character (e.g. a stray '=' with no name before it)
- * is simply skipped over, one character at a time — the same outcome the
- * old regex produced by failing to match at that position and retrying at
- * the next one.
+ * Select all the attributes whether valid or invalid.
  */
-function scanAttributeTokens(attrStr) {
-  const tokens = [];
-  const len = attrStr.length;
-  let i = 0;
-
-  while (i < len) {
-    const tokenStart = i;
-
-    // Leading whitespace before the name.
-    while (i < len && isWhiteSpace(attrStr[i])) i++;
-    if (i >= len) break; // trailing whitespace only — nothing left to read
-
-    if (attrStr[i] === '=') {
-      // No name before this '=' — not a valid attribute start. Move past
-      // just this one character and try again from the next position.
-      i = tokenStart + 1;
-      continue;
-    }
-
-    const leadingWs = attrStr.slice(tokenStart, i);
-
-    // Attribute name — everything up to the next whitespace or '='.
-    const nameStart = i;
-    while (i < len && !isWhiteSpace(attrStr[i]) && attrStr[i] !== '=') i++;
-    const name = attrStr.slice(nameStart, i);
-
-    // Optional whitespace + '='.
-    let equalsGroup; // whitespace + '=' text, or undefined if absent
-    let j = i;
-    while (j < len && isWhiteSpace(attrStr[j])) j++;
-    if (j < len && attrStr[j] === '=') {
-      equalsGroup = attrStr.slice(i, j + 1);
-      i = j + 1;
-    }
-
-    // Optional whitespace + quoted value.
-    let quoteChar;
-    let value;
-    let k = i;
-    while (k < len && isWhiteSpace(attrStr[k])) k++;
-    if (k < len && (attrStr[k] === '"' || attrStr[k] === "'")) {
-      const valueStart = k + 1;
-      const closeIdx = attrStr.indexOf(attrStr[k], valueStart);
-      if (closeIdx !== -1) {
-        quoteChar = attrStr[k];
-        value = attrStr.slice(valueStart, closeIdx);
-        i = closeIdx + 1;
-      }
-      // No closing quote found anywhere in the rest of the string — leave
-      // quoteChar/value undefined, same as the old regex's group failing
-      // to match a backreference-less run.
-    }
-
-    const token = { startIndex: tokenStart };
-    token[1] = leadingWs;
-    token[2] = name;
-    token[3] = equalsGroup;
-    token[4] = quoteChar !== undefined ? true : undefined;
-    token[5] = quoteChar;
-    token[6] = value;
-    tokens.push(token);
-  }
-
-  return tokens;
-}
+const validAttrStrRegxp = new RegExp('(\\s*)([^\\s=]+)(\\s*=)?(\\s*([\'"])(([\\s\\S])*?)\\5)?', 'g');
 
 //attr, ="sd", a="amit's", a="sd"b="saf", ab  cd=""
 
@@ -79478,7 +76621,7 @@ function validateAttributeString(attrStr, options) {
 
   //if(attrStr.trim().length === 0) return true; //empty string
 
-  const matches = scanAttributeTokens(attrStr);
+  const matches = getAllMatches(attrStr, validAttrStrRegxp);
   const attrNames = {};
 
   for (let i = 0; i < matches.length; i++) {
@@ -79580,6 +76723,7 @@ function getLineNumberForPosition(xmlData, index) {
 function getPositionFromMatch(match) {
   return match.startIndex + match[1].length;
 }
+
 ;// CONCATENATED MODULE: ./node_modules/fast-xml-parser/src/fxp.js
 
 
@@ -79619,8 +76763,7 @@ const OptionsBuilder_defaultOptions = {
   numberParseOptions: {
     hex: true,
     leadingZeros: true,
-    eNotation: true,
-    unicode: false
+    eNotation: true
   },
   tagValueProcessor: function (tagName, val) {
     return val;
@@ -79786,24 +76929,10 @@ class XmlNode {
       this.child.push({ [node.tagname]: node.child });
     }
     // if requested, add the startIndex
-    this.addStartIndex(startIndex);
-  }
-
-  addStartIndex(startIndex) {
     if (startIndex !== undefined) {
       // Note: for now we just overwrite the metadata. If we had more complex metadata,
       // we might need to do an object append here:  metadata = { ...metadata, startIndex }
       this.child[this.child.length - 1][METADATA_SYMBOL] = { startIndex };
-    }
-  }
-
-  addEndIndex(endIndex) {
-    const lastChild = this.child[this.child.length - 1];
-    // endIndex is write-once: when updateTag drops a node, the last child is a
-    // previously completed sibling whose endIndex must not be overwritten
-    if (lastChild !== undefined && lastChild[METADATA_SYMBOL] !== undefined
-      && lastChild[METADATA_SYMBOL].endIndex === undefined) {
-      lastChild[METADATA_SYMBOL].endIndex = endIndex;
     }
   }
   /** symbol used for metadata */
@@ -79838,23 +76967,8 @@ class DocTypeReader {
             i = i + 9;
             let angleBracketsCount = 1;
             let hasBody = false, comment = false;
-            let quoteChar = null; // tracks an open SYSTEM/PUBLIC literal before the '[' body
             let exp = "";
             for (; i < xmlData.length; i++) {
-                // Inside a quoted external-identifier literal — XML allows '<'
-                // and '>' as plain data here, so they must not be interpreted
-                // as DOCTYPE structure until the matching quote closes.
-                if (quoteChar !== null) {
-                    if (xmlData[i] === quoteChar) quoteChar = null;
-                    exp += xmlData[i];
-                    continue;
-                }
-                if (!hasBody && !comment && (xmlData[i] === '"' || xmlData[i] === "'")) {
-                    quoteChar = xmlData[i];
-                    exp += xmlData[i];
-                    continue;
-                }
-
                 if (xmlData[i] === '<' && !comment) { //Determine the tag type
                     if (hasBody && hasSeq(xmlData, "!ENTITY", i)) {
                         i += 7;
@@ -79909,7 +77023,7 @@ class DocTypeReader {
                     exp += xmlData[i];
                 }
             }
-            if (quoteChar !== null || angleBracketsCount !== 0) {
+            if (angleBracketsCount !== 0) {
                 throw new Error(`Unclosed DOCTYPE`);
             }
         } else {
@@ -80239,267 +77353,11 @@ function validateEntityName(name, xmlVersion) {
     else
         throw new Error(`Invalid entity name ${name}`);
 }
-;// CONCATENATED MODULE: ./node_modules/anynum/digitTable.js
-/**
- * Flat lookup table: maps Unicode code point → ASCII digit (0-9).
- * Only decimal digit characters (Unicode category Nd) are included.
- *
- * Strategy: Int32Array of size (maxCodePoint - minCodePoint + 1).
- * Value 0xFF means "not a digit". Value 0-9 is the ASCII digit value.
- * This gives O(1) lookup with no branching, no bisect, no loop.
- *
- * Memory: range is 0x0660 to 0x1FBF0 → ~129,936 entries × 1 byte = ~127 KB.
- * Acceptable for a one-time init; lookup is a single array index.
- */
-
-// All known Unicode Nd (decimal digit) script zero code points.
-// Each script has exactly 10 consecutive digits: zero+0 .. zero+9.
-const SCRIPT_ZEROS = [
-  // Basic Latin (ASCII) — included for completeness / pass-through
-  0x0030, // 0-9
-
-  // Arabic scripts
-  0x0660, // Arabic-Indic ٠١٢٣٤٥٦٧٨٩
-  0x06F0, // Extended Arabic-Indic (Urdu/Persian/Sindhi) ۰۱۲۳
-
-  // Indic scripts
-  0x0966, // Devanagari ०१२३४५६७८९
-  0x09E6, // Bengali ০১২৩৪৫৬৭৮৯
-  0x0A66, // Gurmukhi ੦੧੨੩੪੫੬੭੮੯
-  0x0AE6, // Gujarati ૦૧૨૩૪૫૬૭૮૯
-  0x0B66, // Odia ୦୧୨୩୪୫୬୭୮୯
-  0x0BE6, // Tamil ௦௧௨௩௪௫௬௭௮௯
-  0x0C66, // Telugu ౦౧౨౩౪౫౬౭౮౯
-  0x0CE6, // Kannada ೦೧೨೩೪೫೬೭೮೯
-  0x0D66, // Malayalam ൦൧൨൩൪൫൬൭൮൯
-  0x0DE6, // Sinhala Archaic ෦෧෨෩෪෫෬෭෮෯
-
-  // Southeast Asian scripts
-  0x0E50, // Thai ๐๑๒๓๔๕๖๗๘๙
-  0x0ED0, // Lao ໐໑໒໓໔໕໖໗໘໙
-  0x0F20, // Tibetan ༠༡༢༣༤༥༦༧༨༩
-  0x1040, // Myanmar ၀၁၂၃၄၅၆၇၈၉
-  0x1090, // Myanmar Shan ႐႑႒႓႔႕႖႗႘႙
-  0x17E0, // Khmer ០១២៣៤៥៦៧៨៩
-  0x1810, // Mongolian ᠐᠑᠒᠓᠔᠕᠖᠗᠘᠙
-  0x1946, // Limbu ᥆᥇᥈᥉᥊᥋᥌᥍᥎᥏
-  0x19D0, // New Tai Lue ᧐᧑᧒᧓᧔᧕᧖᧗᧘᧙
-  0x1A80, // Tai Tham Hora ᪀᪁᪂᪃᪄᪅᪆᪇᪈᪉
-  0x1A90, // Tai Tham Tham ᪐᪑᪒᪓᪔᪕᪖᪗᪘᪙
-  0x1B50, // Balinese ᭐᭑᭒᭓᭔᭕᭖᭗᭘᭙
-  0x1BB0, // Sundanese ᮰᮱᮲᮳᮴᮵᮶᮷᮸᮹
-  0x1C40, // Lepcha ᱀᱁᱂᱃᱄᱅᱆᱇᱈᱉
-  0x1C50, // Ol Chiki ᱐᱑᱒᱓᱔᱕᱖᱗᱘᱙
-
-  // Fullwidth (CJK context)
-  0xFF10, // Fullwidth ０１２３４５６７８９
-
-  // Mathematical digit variants (Unicode math block)
-  0x1D7CE, // Mathematical Bold
-  0x1D7D8, // Mathematical Double-Struck
-  0x1D7E2, // Mathematical Sans-Serif
-  0x1D7EC, // Mathematical Sans-Serif Bold
-  0x1D7F6, // Mathematical Monospace
-
-  // Other scripts
-  0x104A0, // Osmanya 𐒠𐒡𐒢𐒣𐒤𐒥𐒦𐒧𐒨𐒩
-  0x10D30, // Hanifi Rohingya 𐴰𐴱𐴲𐴳𐴴𐴵𐴶𐴷𐴸𐴹
-  0x11066, // Brahmi 𑁦𑁧𑁨𑁩𑁪𑁫𑁬𑁭𑁮𑁯
-  0x110F0, // Sora Sompeng 𑃰𑃱𑃲𑃳𑃴𑃵𑃶𑃷𑃸𑃹
-  0x11136, // Chakma 𑄶𑄷𑄸𑄹𑄺𑄻𑄼𑄽𑄾𑄿
-  0x111D0, // Sharada 𑇐𑇑𑇒𑇓𑇔𑇕𑇖𑇗𑇘𑇙
-  0x112F0, // Khudawadi 𑋰𑋱𑋲𑋳𑋴𑋵𑋶𑋷𑋸𑋹
-  0x11450, // Newa 𑑐𑑑𑑒𑑓𑑔𑑕𑑖𑑗𑑘𑑙
-  0x114D0, // Tirhuta 𑓐𑓑𑓒𑓓𑓔𑓕𑓖𑓗𑓘𑓙
-  0x11650, // Modi 𑙐𑙑𑙒𑙓𑙔𑙕𑙖𑙗𑙘𑙙
-  0x116C0, // Takri 𑛀𑛁𑛂𑛃𑛄𑛅𑛆𑛇𑛈𑛉
-  0x11730, // Ahom 𑜰𑜱𑜲𑜳𑜴𑜵𑜶𑜷𑜸𑜹
-  0x118E0, // Warang Citi 𑣠𑣡𑣢𑣣𑣤𑣥𑣦𑣧𑣨𑣩
-  0x11950, // Dives Akuru 𑥐𑥑𑥒𑥓𑥔𑥕𑥖𑥗𑥘𑥙
-  0x11BF0, // Khitan Small Script 𑯰𑯱𑯲𑯳𑯴𑯵𑯶𑯷𑯸𑯹
-  0x11C50, // Bhaiksuki 𑱐𑱑𑱒𑱓𑱔𑱕𑱖𑱗𑱘𑱙
-  0x11D50, // Masaram Gondi 𑵐𑵑𑵒𑵓𑵔𑵕𑵖𑵗𑵘𑵙
-  0x11DA0, // Gunjala Gondi 𑶠𑶡𑶢𑶣𑶤𑶥𑶦𑶧𑶨𑶩
-  0x11F50, // Kawi 𑽐𑽑𑽒𑽓𑽔𑽕𑽖𑽗𑽘𑽙
-  0x16A60, // Mro 𖩠𖩡𖩢𖩣𖩤𖩥𖩦𖩧𖩨𖩩
-  0x16AC0, // Tangsa 𖫀𖫁𖫂𖫃𖫄𖫅𖫆𖫇𖫈𖫉
-  0x16B50, // Pahawh Hmong 𖭐𖭑𖭒𖭓𖭔𖭕𖭖𖭗𖭘𖭙
-  0x1E140, // Nyiakeng Puachue Hmong 𞅀𞅁𞅂𞅃𞅄𞅅𞅆𞅇𞅈𞅉
-  0x1E2F0, // Wancho 𞋰𞋱𞋲𞋳𞋴𞋵𞋶𞋷𞋸𞋹
-  0x1E4F0, // Nag Mundari 𞓰𞓱𞓲𞓳𞓴𞓵𞓶𞓷𞓸𞓹
-  0x1E950, // Adlam 𞥐𞥑𞥒𞥓𞥔𞥕𞥖𞥗𞥘𞥙
-  0x1FBF0, // Segmented digit symbols 🯰🯱🯲🯳🯴🯵🯶🯷🯸🯹
-];
-
-// Build a sparse Map for scripts above 0xFFFF (surrogate-pair range).
-// These can't go into a flat Uint8Array indexed by code point efficiently.
-const NOT_DIGIT = 0xFF;
-const HIGH_MAP = new Map(); // codePoint → digit value (0-9)
-
-const LOW_MAX = 0xFFFF;
-const LOW_MIN = 0x0660; // first non-ASCII digit script
-
-// Flat Uint8Array covering 0x0660 .. 0xFFFF
-const TABLE_OFFSET = LOW_MIN;
-const TABLE_SIZE = LOW_MAX - LOW_MIN + 1;
-const TABLE = new Uint8Array(TABLE_SIZE).fill(NOT_DIGIT);
-
-for (const zero of SCRIPT_ZEROS) {
-  for (let d = 0; d < 10; d++) {
-    const cp = zero + d;
-    if (cp <= LOW_MAX) {
-      TABLE[cp - TABLE_OFFSET] = d;
-    } else {
-      HIGH_MAP.set(cp, d);
-    }
-  }
-}
-
-
-
-;// CONCATENATED MODULE: ./node_modules/anynum/anynum.js
-
-
-
-
-const CHAR_0 = 48; // '0'.charCodeAt(0)
-const CHAR_9 = 57; // '9'.charCodeAt(0)
-const CHAR_MINUS = 45; // '-'.charCodeAt(0)
-
-// Unicode minus/hyphen variants worth normalizing to ASCII '-' in numeric context:
-//   U+2212  MINUS SIGN       − (mathematically correct minus)
-//   U+FF0D  FULLWIDTH HYPHEN-MINUS  － (Japanese fullwidth context)
-//   U+FE63  SMALL HYPHEN-MINUS     ﹣ (small form variant)
-//
-// NOT normalized (deliberate):
-//   U+2013  EN DASH  –  (punctuation, not a numeric sign)
-//   U+2014  EM DASH  —  (punctuation)
-//   U+2010  HYPHEN   ‐  (typographic hyphen)
-//
-// Rationale: only characters a human or locale formatter would plausibly use
-// as a numeric minus sign are normalized. Dashes used for punctuation are left
-// alone to avoid mangling non-numeric strings.
-const MINUS_SET = new Set([0x2212, 0xFF0D, 0xFE63]);
-
-/**
- * Normalize all Unicode decimal digit characters in a string to ASCII (0-9),
- * and normalize Unicode minus variants to ASCII '-' (U+002D).
- *
- * Non-digit, non-minus characters are passed through unchanged.
- *
- * Performance design:
- * - Fast path: if the string has no convertible characters, return it unchanged
- *   (zero allocation).
- * - BMP digits (0x0660..0xFFFF excl. surrogates): flat Uint8Array lookup (O(1)).
- * - Supplementary plane digits (> 0xFFFF, encoded as surrogate pairs): Map lookup.
- * - Minus variants: checked inline with a small fixed Set.
- *
- * @param {string} str
- * @returns {string}
- */
-function anynum(str) {
-  if (typeof str !== 'string') return str;
-
-  const len = str.length;
-  if (len === 0) return str;
-
-  // Scan for first character needing conversion.
-  // If none found, return original string (zero allocation).
-  let firstHit = -1;
-
-  for (let i = 0; i < len; i++) {
-    const cc = str.charCodeAt(i);
-
-    // ASCII digit or ASCII minus — already normalized, skip fast
-    if ((cc >= CHAR_0 && cc <= CHAR_9) || cc === CHAR_MINUS) continue;
-
-    // Below first unicode digit script — check minus variants only
-    if (cc < TABLE_OFFSET) {
-      if (MINUS_SET.has(cc)) { firstHit = i; break; }
-      continue;
-    }
-
-    // Surrogate pairs live in BMP range 0xD800-0xDFFF — check before TABLE
-    if (cc >= 0xD800 && cc <= 0xDBFF) {
-      if (i + 1 < len) {
-        const low = str.charCodeAt(i + 1);
-        if (low >= 0xDC00 && low <= 0xDFFF) {
-          const cp = 0x10000 + ((cc - 0xD800) << 10) + (low - 0xDC00);
-          if (HIGH_MAP.has(cp)) { firstHit = i; break; }
-        }
-      }
-      continue;
-    }
-
-    // BMP non-surrogate: flat table lookup; also check minus variants in this range
-    if (TABLE[cc - TABLE_OFFSET] !== NOT_DIGIT || MINUS_SET.has(cc)) {
-      firstHit = i;
-      break;
-    }
-  }
-
-  // Nothing to replace — return original, zero allocation
-  if (firstHit === -1) return str;
-
-  // Build result: copy unchanged prefix, then convert from firstHit onward
-  const chars = [];
-
-  if (firstHit > 0) chars.push(str.slice(0, firstHit));
-
-  for (let i = firstHit; i < len; i++) {
-    const cc = str.charCodeAt(i);
-
-    // ASCII digit or ASCII minus — pass through
-    if ((cc >= CHAR_0 && cc <= CHAR_9) || cc === CHAR_MINUS) {
-      chars.push(str[i]);
-      continue;
-    }
-
-    // Below TABLE_OFFSET — check minus variants, else pass through
-    if (cc < TABLE_OFFSET) {
-      chars.push(MINUS_SET.has(cc) ? '-' : str[i]);
-      continue;
-    }
-
-    // Surrogate pairs
-    if (cc >= 0xD800 && cc <= 0xDBFF) {
-      if (i + 1 < len) {
-        const low = str.charCodeAt(i + 1);
-        if (low >= 0xDC00 && low <= 0xDFFF) {
-          const cp = 0x10000 + ((cc - 0xD800) << 10) + (low - 0xDC00);
-          const d = HIGH_MAP.get(cp);
-          if (d !== undefined) {
-            chars.push(String.fromCharCode(d + 48));
-            i++; // consume low surrogate
-            continue;
-          }
-        }
-      }
-      chars.push(str[i]);
-      continue;
-    }
-
-    // BMP non-surrogate: flat table lookup + minus variants
-    if (MINUS_SET.has(cc)) {
-      chars.push('-');
-      continue;
-    }
-    const d = TABLE[cc - TABLE_OFFSET];
-    chars.push(d !== NOT_DIGIT ? String.fromCharCode(d + 48) : str[i]);
-  }
-
-  return chars.join('');
-}
-
-
-/* harmony default export */ const anynum_anynum = (anynum);
 ;// CONCATENATED MODULE: ./node_modules/strnum/strnum.js
 const hexRegex = /^[-+]?0x[a-fA-F0-9]+$/;
 const binRegex = /^0b[01]+$/;
 const octRegex = /^0o[0-7]+$/;
 const numRegex = /^([\-\+])?(0*)([0-9]*(\.[0-9]*)?)$/;
-
-
 
 const consider = {
     hex: true,
@@ -80510,7 +77368,6 @@ const consider = {
     eNotation: true,
     //skipLike: /regex/,
     infinity: "original", // "null", "infinity" (Infinity type), "string" ("Infinity" (the string literal))
-    unicode: false,
 };
 
 function toNumber(str, options = {}) {
@@ -80522,21 +77379,14 @@ function toNumber(str, options = {}) {
     if (trimmedStr.length === 0) return str;
     else if (options.skipLike !== undefined && options.skipLike.test(trimmedStr)) return str;
     else if (trimmedStr === "0") return 0;
-
-    if (options.unicode) {
-        trimmedStr = anynum_anynum(trimmedStr);
-        if (trimmedStr === "0") return 0; // re-check after normalization
-    }
-    if (options.hex && hexRegex.test(trimmedStr)) {
+    else if (options.hex && hexRegex.test(trimmedStr)) {
         return parse_int(trimmedStr, 16);
     } else if (options.binary && binRegex.test(trimmedStr)) {
         return parse_int(trimmedStr, 2);
     } else if (options.octal && octRegex.test(trimmedStr)) {
         return parse_int(trimmedStr, 8);
-    } else if (!isFinite(trimmedStr)) { //Infinity or not a number
-        const num = Number(trimmedStr);
-        if (Number.isNaN(num)) return str; //not a number: always the original string
-        return handleInfinity(str, num, options); //only +/-Infinity reaches here
+    } else if (!isFinite(trimmedStr)) { //Infinity
+        return handleInfinity(str, Number(trimmedStr), options);
     } else if (trimmedStr.includes('e') || trimmedStr.includes('E')) { //eNotation
         return resolveEnotation(str, trimmedStr, options);
     } else {
@@ -80548,8 +77398,8 @@ function toNumber(str, options = {}) {
             const leadingZeros = match[2];
             let numTrimmedByZeros = trimZeros(match[3]); //complete num without leading zeros
             const decimalAdjacentToLeadingZeros = sign ? // 0., -00., 000.
-                trimmedStr[leadingZeros.length + 1] === "."
-                : trimmedStr[leadingZeros.length] === ".";
+                str[leadingZeros.length + 1] === "."
+                : str[leadingZeros.length] === ".";
 
             //trim ending zeros for floating number
             if (!options.leadingZeros //leading zeros are not allowed
@@ -80597,8 +77447,8 @@ function resolveEnotation(str, trimmedStr, options) {
         const eChar = notation[3].indexOf("e") === -1 ? "E" : "e";
         const leadingZeros = notation[2];
         const eAdjacentToLeadingZeros = sign ? // 0E.
-            trimmedStr[leadingZeros.length + 1] === eChar
-            : trimmedStr[leadingZeros.length] === eChar;
+            str[leadingZeros.length + 1] === eChar
+            : str[leadingZeros.length] === eChar;
 
         if (leadingZeros.length > 1 && eAdjacentToLeadingZeros) return str;
         else if (leadingZeros.length === 1
@@ -80607,7 +77457,8 @@ function resolveEnotation(str, trimmedStr, options) {
         } else if (leadingZeros.length > 0) {
             // Has leading zeros — only accept if leadingZeros option allows it
             if (options.leadingZeros && !eAdjacentToLeadingZeros) {
-                return Number(trimmedStr); // Number() accepts leading zeros; stripping can leave a mantissa-less ".e0"
+                trimmedStr = (notation[1] || "") + notation[3];
+                return Number(trimmedStr);
             } else return str;
         } else {
             // No leading zeros — always valid e-notation, parse it
@@ -80625,11 +77476,7 @@ function resolveEnotation(str, trimmedStr, options) {
  */
 function trimZeros(numStr) {
     if (numStr && numStr.indexOf(".") !== -1) {//float
-        //remove ending zeros without the O(n^2) backtracking that /0+$/ hits
-        //when the string doesn't end in 0 but has a long internal zero-run
-        let end = numStr.length;
-        while (end > 0 && numStr.charCodeAt(end - 1) === 48 /* '0' */) end--;
-        numStr = numStr.slice(0, end);
+        numStr = numStr.replace(/0+$/, ""); //remove ending zeros
         if (numStr === ".") numStr = "0";
         else if (numStr[0] === ".") numStr = "0" + numStr;
         else if (numStr[numStr.length - 1] === ".") numStr = numStr.substring(0, numStr.length - 1);
@@ -80670,7 +77517,6 @@ function handleInfinity(str, num, options) {
             return str; // Return original string like "1e1000"
     }
 }
-
 ;// CONCATENATED MODULE: ./node_modules/fast-xml-parser/src/ignoreAttributes.js
 function ignoreAttributes_getIgnoreAttributesFn(ignoreAttributes) {
     if (typeof ignoreAttributes === 'function') {
@@ -80727,9 +77573,6 @@ class ExpressionSet {
     /** @type {import('./Expression.js').default[]} expressions containing deep wildcard (..) */
     this._deepWildcards = [];
 
-    /** @type {Map<string, import('./Expression.js').default[]>} terminalTag → deep wildcard expressions */
-    this._deepByTerminalTag = new Map();
-
     /** @type {Set<string>} pattern strings already added — used for deduplication */
     this._patterns = new Set();
 
@@ -80761,14 +77604,7 @@ class ExpressionSet {
     this._patterns.add(expression.pattern);
 
     if (expression.hasDeepWildcard()) {
-      const lastSeg = expression.segments[expression.segments.length - 1];
-      if (lastSeg && lastSeg.type !== 'deep-wildcard' && lastSeg.tag !== '*') {
-        const tag = lastSeg.tag;
-        if (!this._deepByTerminalTag.has(tag)) this._deepByTerminalTag.set(tag, []);
-        this._deepByTerminalTag.get(tag).push(expression);
-      } else {
-        this._deepWildcards.push(expression);
-      }
+      this._deepWildcards.push(expression);
       return this;
     }
 
@@ -80902,13 +77738,7 @@ class ExpressionSet {
       }
     }
 
-    // 3. Deep wildcards — indexed by terminal tag, then unindexed fallback
-    const deepBucket = this._deepByTerminalTag.get(tag);
-    if (deepBucket) {
-      for (let i = 0; i < deepBucket.length; i++) {
-        if (matcher.matches(deepBucket[i])) return deepBucket[i];
-      }
-    }
+    // 3. Deep wildcards — cannot be pre-filtered by depth or tag
     for (let i = 0; i < this._deepWildcards.length; i++) {
       if (matcher.matches(this._deepWildcards[i])) return this._deepWildcards[i];
     }
@@ -80954,6 +77784,7 @@ const BASIC_LATIN = {
   num: '#',
   dollar: '$',
   percent: '%',
+  amp: '&',
   ast: '*',
   commat: '@',
   lowbar: '_',
@@ -81385,6 +78216,9 @@ const CYRILLIC = {
  */
 const MATH = {
   plus: '+',
+  minus: '−',
+  mnplus: '∓',
+  mp: '∓',
   pm: '±',
   times: '×',
   div: '÷',
@@ -81457,6 +78291,10 @@ const MATH = {
   bumpe: '≏',
   bumpeq: '≏',
   HumpEqual: '≏',
+  dotminus: '∸',
+  minusd: '∸',
+  plusdo: '∔',
+  dotplus: '∔',
   le: '≤',
   LessEqual: '≤',
   ge: '≥',
@@ -81572,6 +78410,7 @@ const MATH_ADVANCED = {
   wr: '≀',
   wreath: '≀',
   nsime: '≄',
+  nsimeq: '≄',
   nsimeq: '≄',
   ncong: '≇',
   simne: '≆',
@@ -81689,6 +78528,10 @@ const ARROWS = {
   mapsto: '↦',
   mapstodown: '↧',
   crarr: '↵',
+  nwarrow: '↖',
+  nearrow: '↗',
+  searrow: '↘',
+  swarrow: '↙',
   nleftarrow: '↚',
   nleftrightarrow: '↮',
   nrightarrow: '↛',
@@ -81729,6 +78572,7 @@ const ARROWS = {
   ldrushar: '⥋',
   rdldhar: '⥩',
   lrhard: '⥭',
+  rlhar: '⇌',
   uharr: '↾',
   uharl: '↿',
   dharr: '⇂',
@@ -81744,6 +78588,7 @@ const ARROWS = {
   nhArr: '⇎',
   nlarr: '↚',
   nlArr: '⇍',
+  nrarr: '↛',
   nrArr: '⇏',
   larrb: '⇤',
   LeftArrowBar: '⇤',
@@ -81905,6 +78750,7 @@ const PUNCTUATION = {
   DiacriticalDot: '˙',
   DiacriticalDoubleAcute: '˝',
   grave: '`',
+  acute: '´',
 };
 
 /**
@@ -81918,6 +78764,7 @@ const CURRENCY = {
   yen: '¥',
   euro: '€',
   dollar: '$',
+  euro: '€',
   fnof: 'ƒ',
   inr: '₹',
   af: '؋',
@@ -82017,11 +78864,32 @@ const MISC_SYMBOLS = {
   Vdash: '⊩',
   dashv: '⊣',
   vDash: '⊨',
+  Vdash: '⊩',
   Vvdash: '⊪',
   nvdash: '⊬',
   nvDash: '⊭',
   nVdash: '⊮',
   nVDash: '⊯',
+};
+
+/**
+ * All entities combined (if you need everything)
+ * @type {Record<string, string>}
+ */
+const ALL_ENTITIES = {
+  ...BASIC_LATIN,
+  ...LATIN_ACCENTS,
+  ...LATIN_EXTENDED,
+  ...GREEK,
+  ...CYRILLIC,
+  ...MATH,
+  ...MATH_ADVANCED,
+  ...ARROWS,
+  ...SHAPES,
+  ...PUNCTUATION,
+  ...CURRENCY,
+  ...FRACTIONS,
+  ...MISC_SYMBOLS,
 };
 
 const XML = {
@@ -82064,30 +78932,6 @@ const COMMON_HTML = {
 // ---------------------------------------------------------------------------
 
 
-
-// ---------------------------------------------------------------------------
-// Entity hook action constants
-// ---------------------------------------------------------------------------
-
-/**
- * Action constants for `onExternalEntity` and `onInputEntity` hooks.
- *
- * Use these instead of raw strings to avoid typos:
- *
- * @example
- * import EntityDecoder, { ENTITY_ACTION } from './EntityDecoder.js';
- * const dec = new EntityDecoder({
- *   onInputEntity: (name, value) => ENTITY_ACTION.BLOCK,
- * });
- */
-const ENTITY_ACTION = Object.freeze({
-  /** Resolve and expand the entity normally. */
-  ALLOW: 'allow',
-  /** Silently skip this entity — it will not be registered. */
-  BLOCK: 'block',
-  /** Throw an error, aborting entity registration entirely. */
-  THROW: 'throw',
-});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -82253,14 +79097,6 @@ class EntityDecoder {
    *   the effective action is max(onNCR, rangeMinimum).
    * @param {'remove'|'throw'} [options.ncr.nullNCR='remove']
    *   Action for U+0000 (null). 'allow' and 'leave' are clamped to 'remove' since null is never safe.
-   * @param {((name: string, value: string) => 'allow'|'block'|'throw')|null} [options.onExternalEntity=null]
-   *   Hook called when an external entity is registered via `setExternalEntities()` or
-   *   `addExternalEntity()`. Return `ENTITY_ACTION.ALLOW` to accept the entity,
-   *   `ENTITY_ACTION.BLOCK` to silently skip it, or `ENTITY_ACTION.THROW` to abort with an error.
-   * @param {((name: string, value: string) => 'allow'|'block'|'throw')|null} [options.onInputEntity=null]
-   *   Hook called when an input entity is registered via `addInputEntities()`. Return
-   *   `ENTITY_ACTION.ALLOW` to accept, `ENTITY_ACTION.BLOCK` to silently skip, or
-   *   `ENTITY_ACTION.THROW` to abort with an error.
    */
   constructor(options = {}) {
     this._limit = options.limit || {};
@@ -82296,43 +79132,6 @@ class EntityDecoder {
     this._ncrXmlVersion = ncrCfg.xmlVersion;
     this._ncrOnLevel = ncrCfg.onLevel;
     this._ncrNullLevel = ncrCfg.nullLevel;
-
-    // --- Registration hooks ---
-    /** @type {((name: string, value: string) => 'allow'|'block'|'throw')|null} */
-    this._onExternalEntity = typeof options.onExternalEntity === 'function'
-      ? options.onExternalEntity
-      : null;
-    /** @type {((name: string, value: string) => 'allow'|'block'|'throw')|null} */
-    this._onInputEntity = typeof options.onInputEntity === 'function'
-      ? options.onInputEntity
-      : null;
-  }
-
-  // -------------------------------------------------------------------------
-  // Private: registration hook dispatch
-  // -------------------------------------------------------------------------
-
-  /**
-   * Invoke a registration hook for a single entity name/value pair.
-   * Returns true when the entity should be accepted, false when it should be
-   * silently skipped (BLOCK), and throws when the hook returns THROW.
-   *
-   * @param {((name: string, value: string) => 'allow'|'block'|'throw')|null} hook
-   * @param {string} name
-   * @param {string} value
-   * @param {string} context  — used in error messages ('external' | 'input')
-   * @returns {boolean}  true = accept, false = skip
-   */
-  _applyRegistrationHook(hook, name, value, context) {
-    if (!hook) return true; // no hook → always accept
-    const action = hook(name, value);
-    if (action === ENTITY_ACTION.BLOCK) return false;
-    if (action === ENTITY_ACTION.THROW) {
-      throw new Error(
-        `[EntityDecoder] Registration of ${context} entity "&${name};" was rejected by hook`
-      );
-    }
-    return true; // ALLOW or any unknown return value → accept
   }
 
   // -------------------------------------------------------------------------
@@ -82342,9 +79141,6 @@ class EntityDecoder {
   /**
    * Replace the full set of persistent external entities.
    * All keys are validated — throws on invalid characters.
-   * If `onExternalEntity` is set, it is called once per entry; entries that
-   * return `ENTITY_ACTION.BLOCK` are silently omitted, `ENTITY_ACTION.THROW`
-   * aborts the whole call.
    * @param {Record<string, string | { regex?: RegExp, val: string }>} map
    */
   setExternalEntities(map) {
@@ -82353,34 +79149,18 @@ class EntityDecoder {
         EntityDecoder_validateEntityName(key);
       }
     }
-    if (!this._onExternalEntity) {
-      this._externalMap = mergeEntityMaps(map);
-      return;
-    }
-    // Hook present — resolve values first, then filter
-    const flat = mergeEntityMaps(map);
-    const filtered = Object.create(null);
-    for (const [name, value] of Object.entries(flat)) {
-      if (this._applyRegistrationHook(this._onExternalEntity, name, value, 'external')) {
-        filtered[name] = value;
-      }
-    }
-    this._externalMap = filtered;
+    this._externalMap = mergeEntityMaps(map);
   }
 
   /**
    * Add a single persistent external entity.
-   * If `onExternalEntity` is set it is called before the entity is stored;
-   * `ENTITY_ACTION.BLOCK` silently skips storage, `ENTITY_ACTION.THROW` raises.
    * @param {string} key
    * @param {string} value
    */
   addExternalEntity(key, value) {
     EntityDecoder_validateEntityName(key);
     if (typeof value === 'string' && value.indexOf('&') === -1) {
-      if (this._applyRegistrationHook(this._onExternalEntity, key, value, 'external')) {
-        this._externalMap[key] = value;
-      }
+      this._externalMap[key] = value;
     }
   }
 
@@ -82391,25 +79171,12 @@ class EntityDecoder {
   /**
    * Inject DOCTYPE entities for the current document.
    * Also resets per-document expansion counters.
-   * If `onInputEntity` is set it is called once per entry; entries returning
-   * `ENTITY_ACTION.BLOCK` are silently omitted, `ENTITY_ACTION.THROW` aborts.
    * @param {Record<string, string | { regx?: RegExp, regex?: RegExp, val: string }>} map
    */
   addInputEntities(map) {
     this._totalExpansions = 0;
     this._expandedLength = 0;
-    if (!this._onInputEntity) {
-      this._inputMap = mergeEntityMaps(map);
-      return;
-    }
-    const flat = mergeEntityMaps(map);
-    const filtered = Object.create(null);
-    for (const [name, value] of Object.entries(flat)) {
-      if (this._applyRegistrationHook(this._onInputEntity, name, value, 'input')) {
-        filtered[name] = value;
-      }
-    }
-    this._inputMap = filtered;
+    this._inputMap = mergeEntityMaps(map);
   }
 
   // -------------------------------------------------------------------------
@@ -82454,7 +79221,7 @@ class EntityDecoder {
   decode(str) {
     if (typeof str !== 'string' || str.length === 0) return str;
     //TODO: check if needed
-    if (str.indexOf('&') === -1) return str; // fast path — no entities at all
+    //if (str.indexOf('&') === -1) return str; // fast path — no entities at all
 
     const original = str;
     const chunks = [];
@@ -82702,1154 +79469,9 @@ class EntityDecoder {
     return this._applyNCRAction(effective, token, cp);
   }
 }
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/sql.js
-/**
- * SQL context patterns — high-precision rules only.
- *
- * These rules have very low false-positive risk and are safe to apply to
- * general user text (names, descriptions, search queries, etc.).
- * All patterns are ReDoS-safe — unlike the `sql-injection` npm package
- * which has an active CVE on its own detection regexes.
- *
- * For exhaustive coverage including noisier heuristics (comment sequences,
- * hex literals, stacked queries with semicolons), use 'SQL-STRICT' instead.
- * Apply 'SQL-STRICT' only to strings that are specifically SQL fragments,
- * not to general free-text fields.
- */
-
-const SQL_PATTERNS = [
-  {
-    id: 'sql-block-comment-open',
-    description: 'SQL block comment open: /* ... */ — unusual in legitimate user text',
-    pattern: /\/\*/,
-  },
-  {
-    id: 'sql-union-select',
-    description: 'UNION SELECT — most common SQL injection aggregation attack',
-    pattern: /\bUNION\s{1,20}(?:ALL\s{1,20})?SELECT\b/i,
-  },
-  {
-    id: 'sql-drop-table',
-    description: 'DROP TABLE — destructive DDL injection',
-    pattern: /\bDROP\s{1,20}TABLE\b/i,
-  },
-  {
-    id: 'sql-drop-database',
-    description: 'DROP DATABASE — destructive DDL injection',
-    pattern: /\bDROP\s{1,20}DATABASE\b/i,
-  },
-  {
-    id: 'sql-insert-into',
-    description: 'INSERT INTO — data injection',
-    pattern: /\bINSERT\s{1,20}INTO\b/i,
-  },
-  {
-    id: 'sql-delete-from',
-    description: 'DELETE FROM — data deletion injection',
-    pattern: /\bDELETE\s{1,20}FROM\b/i,
-  },
-  {
-    id: 'sql-update-set',
-    description: 'UPDATE ... SET — data modification injection',
-    // Allows arbitrary content between UPDATE and SET (table name, alias, etc.)
-    pattern: /\bUPDATE\b[\s\S]{1,60}\bSET\b/i,
-  },
-  {
-    id: 'sql-exec-xp',
-    description: 'EXEC xp_ — MSSQL extended stored procedure execution',
-    pattern: /\bEXEC(?:UTE)?\s{1,20}xp_/i,
-  },
-  {
-    id: 'sql-tautology-string',
-    description: "Classic string tautology: ' OR '1'='1 or \" OR \"1\"=\"1\"",
-    // Last quote is optional — injection may truncate it: ' OR '1'='1--
-    pattern: /'\s{0,10}OR\s{0,10}'[^']{0,20}'\s*=\s*'[^']{0,20}/i,
-  },
-  {
-    id: 'sql-tautology-numeric',
-    description: 'Numeric tautology: OR 1=1',
-    pattern: /\bOR\s{1,10}1\s*=\s*1\b/i,
-  },
-  {
-    id: 'sql-always-true-zero',
-    description: 'Numeric tautology: OR 0=0',
-    pattern: /\bOR\s{1,10}0\s*=\s*0\b/i,
-  },
-  {
-    id: 'sql-sleep-benchmark',
-    description: 'Time-based blind injection: SLEEP() or BENCHMARK()',
-    pattern: /\b(?:SLEEP|BENCHMARK)\s*\(/i,
-  },
-  {
-    id: 'sql-waitfor-delay',
-    description: 'MSSQL time-based blind injection: WAITFOR DELAY',
-    pattern: /\bWAITFOR\s{1,20}DELAY\b/i,
-  },
-  {
-    id: 'sql-char-function',
-    description: 'CHAR() function — used to obfuscate injected strings',
-    pattern: /\bCHAR\s*\(\s*\d{1,3}/i,
-  },
-  {
-    id: 'sql-information-schema',
-    description: 'INFORMATION_SCHEMA — reconnaissance query for table/column enumeration',
-    pattern: /\bINFORMATION_SCHEMA\b/i,
-  },
-];
-
-/* harmony default export */ const sql = (SQL_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/sql-strict.js
-/**
- * SQL-STRICT context patterns.
- *
- * Extends the base 'SQL' context with three additional rules that are
- * effective at detecting real injections but carry a higher false-positive
- * risk on general free-text input.
- *
- * Use 'SQL-STRICT' when:
- *   - The string is specifically a SQL fragment or database identifier
- *   - You control the input domain (e.g. a dedicated SQL search field)
- *   - You can tolerate occasional false positives in exchange for broader coverage
- *
- * Use 'SQL' (not STRICT) when:
- *   - The field is general user text (names, descriptions, comments)
- *   - False positives would block legitimate content (e.g. "see note -- above")
- *
- * Rules moved here from 'SQL' due to false-positive risk:
- *
- *   sql-line-comment   — "--" fires on "see note -- above", "value--", CSS var(--primary)
- *   sql-stacked-query  — "; SELECT" fires on legitimate prose with semicolons + SQL words
- *   sql-hex-encoding   — "0xDEAD" fires on hex values in technical docs and log output
- */
-
-
-
-const SQL_STRICT_EXTRA = [
-  {
-    id: 'sql-line-comment',
-    description: 'SQL line comment: -- followed by whitespace or end of string',
-    pattern: /--(?:\s|$)/,
-  },
-  {
-    id: 'sql-stacked-query',
-    description: 'Stacked queries: semicolon immediately followed by a SQL keyword',
-    pattern: /;\s{0,10}(?:SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC)\b/i,
-  },
-  {
-    id: 'sql-hex-encoding',
-    description: 'Hex-encoded string injection: 0x41414141 style (MySQL)',
-    pattern: /\b0x[0-9a-f]{4,}/i,
-  },
-];
-
-// SQL-STRICT = all base SQL rules + the three noisy extras
-const SQL_STRICT_PATTERNS = [...sql, ...SQL_STRICT_EXTRA];
-
-/* harmony default export */ const sql_strict = (SQL_STRICT_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/util/decode-entities.js
-/**
- * Decode the HTML character references that matter for markup-context
- * detection.
- *
- * Browsers decode character references in attribute values before they
- * interpret a URL, so `javascript&#58;alert(1)` in an href is the
- * `javascript:` scheme. The HTML/XML/SVG rules match literal characters, so
- * without this step such payloads slip through.
- *
- * Deliberately NOT a full entity decoder. It decodes only:
- *   - decimal refs  &#58;  &#058;  &#00000058;  &#58   (any leading zeros,
- *                   trailing ; optional — browsers accept both)
- *   - hex refs      &#x3a; &#X3A; &#x0000003a; &#x3a   (same)
- *   - named refs    &colon;  &Tab;  &NewLine;
- *       Named refs are CASE-SENSITIVE and REQUIRE the trailing ';', exactly
- *       like a browser (so `&COLON;` and `&colon` are not decoded).
- *       &Tab; / &NewLine; matter because the URL parser strips tab/newline,
- *       so `java&Tab;script:` is still a javascript: URL.
- *
- * It does NOT decode &amp; (single pass only), so double-encoded text such as
- * "&amp;lt;script&amp;gt;" stays literal — a browser renders that as text.
- *
- * All quantifiers are bounded; no ReDoS risk.
- *
- * @param {string} input
- * @returns {string}
- */
-const NAMED = Object.freeze({
-  colon: ':',
-  Tab: '\t',
-  NewLine: '\n',
-});
-
-const ENTITY_RE =
-  /&(?:#[xX]0*([0-9a-fA-F]{1,6});?|#0*([0-9]{1,7});?|([a-zA-Z][a-zA-Z0-9]{1,15});)/g;
-
-function decodeEntities(input) {
-  if (input.indexOf('&') === -1) return input;
-
-  return input.replace(ENTITY_RE, (match, hex, dec, name) => {
-    if (name !== undefined) {
-      return Object.prototype.hasOwnProperty.call(NAMED, name) ? NAMED[name] : match;
-    }
-    const cp = hex !== undefined ? parseInt(hex, 16) : parseInt(dec, 10);
-    if (!Number.isFinite(cp) || cp > 0x10ffff) return match;
-    return String.fromCodePoint(cp);
-  });
-}
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/html.js
-/**
- * HTML context patterns.
- *
- * Detects XSS vectors that are dangerous when a string ends up rendered as HTML.
- * All patterns use bounded quantifiers to ensure linear-time matching (ReDoS-safe).
- *
- * Each entry is { pattern: RegExp, id: string, description: string }
- * so callers can inspect which rule fired if they need to.
- */
-
-const HTML_PATTERNS = [
-  {
-    id: 'html-script-open',
-    description: '<script opening tag',
-    pattern: /<script[\s>/]/i,
-  },
-  {
-    id: 'html-script-close',
-    description: '</script closing tag',
-    pattern: /<\/script[\s>]/i,
-  },
-  {
-    id: 'html-javascript-protocol',
-    description: 'javascript: URI scheme (with optional whitespace/encoding)',
-    // Handles j&#x61;vascript:, j\u0061vascript:, and whitespace variants
-    pattern: /j[\t\n\r ]*a[\t\n\r ]*v[\t\n\r ]*a[\t\n\r ]*s[\t\n\r ]*c[\t\n\r ]*r[\t\n\r ]*i[\t\n\r ]*p[\t\n\r ]*t[\t\n\r ]*:/i,
-  },
-  {
-    id: 'html-vbscript-protocol',
-    description: 'vbscript: URI scheme',
-    pattern: /vbscript[\t\n\r ]*:/i,
-  },
-  {
-    id: 'html-data-html',
-    description: 'data:text/html URI — can execute scripts in browsers',
-    pattern: /data[\t\n\r ]*:[\t\n\r ]*text\/html/i,
-  },
-  {
-    id: 'html-data-xhtml',
-    description: 'data:application/xhtml+xml URI',
-    pattern: /data[\t\n\r ]*:[\t\n\r ]*application\/xhtml/i,
-  },
-  {
-    id: 'html-data-svg',
-    description: 'data:image/svg+xml URI — can execute scripts',
-    pattern: /data[\t\n\r ]*:[\t\n\r ]*image\/svg\+xml/i,
-  },
-  {
-    id: 'html-inline-event-handler',
-    description: 'Inline event handler attributes: onclick=, onerror=, onload=, etc.',
-    // \bon ensures we match a word boundary so "phonetic=" is not caught
-    pattern: /\bon\w{1,30}\s*=/i,
-  },
-  {
-    id: 'html-entity-obfuscated-script',
-    description: 'HTML-entity-encoded <script (e.g. &#x3C;script or &lt;script)',
-    // Entities include optional trailing semicolon: &#x3C; or &#x3C (both valid in HTML5)
-    pattern: /(?:&#x0*3[Cc];?|&#0*60;?|&lt;)\s*script/i,
-  },
-  {
-    id: 'html-entity-obfuscated-javascript',
-    description: 'HTML-entity-encoded javascript: (partial — catches common &#106; or &#x6a; for "j")',
-    pattern: /(?:&#x0*6[Aa];?|&#0*106;?)\s*(?:&#x0*61;?|a)[\s\S]{0,80}script\s*:/i,
-  },
-  {
-    id: 'html-style-expression',
-    description: 'CSS expression() — IE-era code execution in style attributes',
-    pattern: /style[\s\S]{0,20}expression\s*\(/i,
-  },
-  {
-    id: 'html-object-embed',
-    description: '<object or <embed tags that can load active content',
-    pattern: /<(?:object|embed)[\s>/]/i,
-  },
-  {
-    id: 'html-base-tag',
-    description: '<base href= — can hijack all relative URLs on a page',
-    pattern: /<base[\s>]/i,
-  },
-  {
-    id: 'html-meta-refresh',
-    description: '<meta http-equiv="refresh" — can redirect users',
-    pattern: /<meta[\s\S]{0,40}http-equiv[\s\S]{0,20}refresh/i,
-  },
-  {
-    id: 'html-srcdoc',
-    description: 'srcdoc= attribute on iframes — embeds HTML that can run scripts',
-    pattern: /srcdoc\s*=/i,
-  },
-  {
-    id: 'html-iframe',
-    description: '<iframe tag',
-    pattern: /<iframe[\s>/]/i,
-  },
-  {
-    id: 'html-form',
-    description: '<form tag — can be used for phishing / credential harvesting injection',
-    pattern: /<form[\s>/]/i,
-  },
-];
-
-/* harmony default export */ const html = (HTML_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/xml.js
-/**
- * XML context patterns.
- *
- * Detects injection vectors that are specifically dangerous when a string
- * is inserted into an XML document (not HTML rendering context).
- *
- * Key distinction from HTML: these patterns target parser-level attacks —
- * things that can confuse or subvert an XML parser, trigger external entity
- * resolution, or inject DTD content. HTML rendering concerns (XSS) belong
- * in the HTML context.
- */
-
-const XML_PATTERNS = [
-  {
-    id: 'xml-cdata-injection',
-    description: 'CDATA section injection: <![CDATA[ breaks out of text node context',
-    pattern: /<!\[CDATA\[/i,
-  },
-  {
-    id: 'xml-cdata-close',
-    description: 'CDATA close sequence: ]]> can terminate an enclosing CDATA section',
-    pattern: /\]\]>/,
-  },
-  {
-    id: 'xml-processing-instruction',
-    description: 'XML processing instruction: <?xml-stylesheet or <?php etc.',
-    pattern: /<\?(?:xml[\- ]|php|asp)/i,
-  },
-  {
-    id: 'xml-doctype-injection',
-    description: 'DOCTYPE declaration embedded in content — can define entities',
-    // Match <!DOCTYPE followed by end-of-string, whitespace, or [ (internal subset)
-    pattern: /<!DOCTYPE(?:[\s[]|$)/i,
-  },
-  {
-    id: 'xml-entity-system',
-    description: 'SYSTEM keyword — used in external entity declarations (XXE)',
-    pattern: /\bSYSTEM\s+["']/i,
-  },
-  {
-    id: 'xml-entity-public',
-    description: 'PUBLIC keyword — used in external entity declarations (XXE)',
-    pattern: /\bPUBLIC\s+["']/i,
-  },
-  {
-    id: 'xml-entity-declaration',
-    description: '<!ENTITY declaration — defines entities, potential XXE or entity expansion',
-    pattern: /<!ENTITY[\s%]/i,
-  },
-  {
-    id: 'xml-billion-laughs',
-    description: 'Entity reference chaining / billion laughs: repeated &eX; style references',
-    // Heuristic: 3+ consecutive entity refs suggests expansion attack
-    pattern: /(?:&\w{1,20};){3,}/,
-  },
-  {
-    id: 'xml-namespace-confusion',
-    description: 'xmlns: attribute injection — can redefine namespaces to confuse parsers',
-    // pattern: /\bxmlns\s*(?::\w{1,40})?\s*=/i,
-    pattern: /\bxmlns(?::\w{1,40})?\s*=/i,
-  },
-  {
-    id: 'xml-comment-injection',
-    description: '<!-- comment injection — can hide content from some parsers',
-    pattern: /<!--/,
-  },
-  {
-    id: 'xml-comment-close',
-    description: '--> closes an enclosing XML comment',
-    pattern: /-->/,
-  },
-  {
-    id: 'xml-pi-close',
-    description: '?> closes an enclosing processing instruction',
-    pattern: /\?>/,
-  },
-];
-
-/* harmony default export */ const xml = (XML_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/svg.js
-/**
- * SVG context patterns.
- *
- * SVG is XML-based but renders in browsers, giving it a unique attack surface
- * that combines XML parser behaviour with browser rendering and JavaScript execution.
- *
- * Many of these vectors bypass HTML sanitizers that don't understand SVG semantics
- * (DOMPurify has documented bypass vulnerabilities specifically in SVG/XML context).
- */
-
-const SVG_PATTERNS = [
-  {
-    id: 'svg-script-element',
-    description: '<script element inside SVG executes JavaScript',
-    pattern: /<script[\s>/]/i,
-  },
-  {
-    id: 'svg-xlink-href-javascript',
-    description: 'xlink:href with javascript: — classic SVG XSS via <a> or <use>',
-    pattern: /xlink\s*:\s*href\s*=\s*["']?\s*javascript\s*:/i,
-  },
-  {
-    id: 'svg-href-javascript',
-    description: 'href= with javascript: in SVG context (<a>, <animate>, etc.)',
-    pattern: /href\s*=\s*["']?\s*javascript\s*:/i,
-  },
-  {
-    id: 'svg-foreignobject',
-    description: '<foreignObject embeds HTML inside SVG — can execute scripts',
-    pattern: /<foreignObject[\s>/]/i,
-  },
-  {
-    id: 'svg-use-external',
-    description: '<use xlink:href or href pointing to external resource (non-fragment URL)',
-    // Match <use with href= where the value starts with a non-# character (external URL)
-    // [\"'][^#] catches quoted values not starting with #; [^\"'#\s>] catches unquoted
-    pattern: /<use[\s\S]{0,60}(?:xlink\s*:\s*)?href\s*=\s*(?:["'][^#]|[^"'#\s>])/i,
-  },
-  {
-    id: 'svg-animate-href',
-    description: '<animate attributeName="href" — can dynamically change href to javascript:',
-    pattern: /<animate[\s\S]{0,80}attributeName\s*=\s*["'][\s]*href["']/i,
-  },
-  {
-    id: 'svg-animate-xlinkhref',
-    description: '<animate attributeName="xlink:href"',
-    pattern: /<animate[\s\S]{0,80}attributeName\s*=\s*["'][\s]*xlink\s*:\s*href["']/i,
-  },
-  {
-    id: 'svg-set-javascript',
-    description: '<set to="javascript:..." — sets an attribute to a javascript: URI',
-    pattern: /<set[\s\S]{0,80}to\s*=\s*["']?\s*javascript\s*:/i,
-  },
-  {
-    id: 'svg-event-handler',
-    description: 'SVG-specific event handler attributes: onload=, onerror=, onactivate=, etc.',
-    pattern: /\bon(?:load|error|activate|begin|end|repeat|focus|blur|click|mouse\w{1,20}|key\w{1,20})\s*=/i,
-  },
-  {
-    id: 'svg-handler-generic',
-    description: 'Generic on* handler catch-all for SVG attributes',
-    pattern: /\bon\w{1,30}\s*=/i,
-  },
-  {
-    id: 'svg-filter-feimage',
-    description: '<feImage href= — filter primitive that can load external resources',
-    pattern: /<feImage[\s\S]{0,80}(?:xlink\s*:\s*)?href\s*=/i,
-  },
-  {
-    id: 'svg-image-external',
-    description: '<image xlink:href with http/https or javascript protocol',
-    pattern: /<image[\s\S]{0,80}(?:xlink\s*:\s*)?href\s*=\s*["']?\s*(?:https?|javascript)\s*:/i,
-  },
-  {
-    id: 'svg-style-javascript',
-    description: 'style= attribute containing javascript: (e.g. background:url(javascript:...))',
-    pattern: /style\s*=[\s\S]{0,60}javascript\s*:/i,
-  },
-];
-
-/* harmony default export */ const svg = (SVG_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/shell.js
-/**
- * SHELL context patterns.
- *
- * Detects shell injection vectors and path traversal patterns.
- * Designed for use when a string will be passed to a shell command,
- * used as a file path, or interpolated into OS-level operations.
- */
-
-const SHELL_PATTERNS = [
-  {
-    id: 'shell-path-traversal-unix',
-    description: 'Unix path traversal: ../  — climbing the directory tree',
-    pattern: /\.\.\//,
-  },
-  {
-    id: 'shell-path-traversal-windows',
-    description: 'Windows path traversal: ..\\ — climbing the directory tree',
-    pattern: /\.\.\\/,
-  },
-  {
-    id: 'shell-path-traversal-encoded',
-    description: 'URL-encoded path traversal: %2e%2e or %2f variants',
-    pattern: /%2e%2e|%2f\.\.|\.\.%2f/i,
-  },
-  {
-    id: 'shell-null-byte',
-    description: 'Null byte injection: \\x00 or %00 — truncates strings in C-backed functions',
-    pattern: /\x00|%00/,
-  },
-  {
-    id: 'shell-semicolon',
-    description: 'Semicolon command separator: cmd1; cmd2',
-    pattern: /;/,
-  },
-  {
-    id: 'shell-pipe',
-    description: 'Pipe operator: cmd1 | cmd2',
-    pattern: /\|/,
-  },
-  {
-    id: 'shell-and-operator',
-    description: 'AND operator: cmd1 && cmd2',
-    pattern: /&&/,
-  },
-  {
-    id: 'shell-or-operator',
-    description: 'OR operator: cmd1 || cmd2',
-    pattern: /\|\|/,
-  },
-  {
-    id: 'shell-backtick',
-    description: 'Backtick command substitution: `cmd`',
-    pattern: /`/,
-  },
-  {
-    id: 'shell-dollar-paren',
-    description: 'Dollar-paren command substitution: $(cmd)',
-    pattern: /\$\(/,
-  },
-  {
-    id: 'shell-dollar-brace',
-    description: 'Dollar-brace variable expansion: ${var} — can be abused for injection',
-    pattern: /\$\{/,
-  },
-  {
-    id: 'shell-redirect-out',
-    description: 'Output redirection: cmd > file or cmd >> file',
-    pattern: />{1,2}/,
-  },
-  {
-    id: 'shell-redirect-in',
-    description: 'Input redirection: cmd < file',
-    pattern: /</,
-  },
-  {
-    id: 'shell-newline-injection',
-    description: 'Newline injection: \\n or \\r — can inject new shell commands',
-    pattern: /[\n\r]/,
-  },
-  {
-    id: 'shell-glob-star',
-    description: 'Glob expansion: * or ? — can expand to unintended files',
-    // Only flag when combined with path separators to reduce false positives
-    pattern: /[/\\][*?]/,
-  },
-  {
-    id: 'shell-absolute-root',
-    description: 'Absolute root path injection: string starting with / or \\ (Windows UNC)',
-    pattern: /^(?:\/|\\\\)/,
-  },
-  {
-    id: 'shell-windows-drive',
-    description: 'Windows drive letter path injection: C:\\ or D:/',
-    pattern: /^[a-zA-Z]:[/\\]/,
-  },
-  {
-    id: 'shell-curl-wget',
-    description: 'curl/wget with URL or flags — can exfiltrate data or download payloads',
-    // Require a URL scheme (http/https/ftp) or a flag (-) to reduce false positives
-    // "curl is a tool" won't match; "curl http://..." or "curl -s ..." will
-    pattern: /\b(?:curl|wget)\s+(?:https?:\/\/|ftp:\/\/|-)/i,
-  },
-];
-
-/* harmony default export */ const shell = (SHELL_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/redos.js
-/**
- * REDOS context patterns.
- *
- * Detects strings that, if used as regular expressions, could cause
- * catastrophic backtracking (ReDoS — Regular Expression Denial of Service).
- *
- * These patterns detect the structural forms that lead to exponential or
- * polynomial backtracking in NFA-based regex engines (V8, PCRE, Java, etc.).
- *
- * Use this context when user-supplied strings will be compiled into RegExp objects.
- */
-
-const REDOS_PATTERNS = [
-  {
-    id: 'redos-nested-quantifier-plus',
-    description: 'Nested + quantifier inside a group with outer quantifier: (a+)+, (.+b)*, etc.',
-    // Matches any group containing a + quantifier, with an outer * or + — catches (a+)+, (.+b)*, etc.
-    pattern: /\([^)]*\+[^)]*\)[+*]/,
-  },
-  {
-    id: 'redos-nested-quantifier-star',
-    description: 'Nested * quantifier: (a*)* or (a*)+ — catastrophic backtracking',
-    pattern: /\([^)]*\*[^)]*\)[*+]/,
-  },
-  {
-    id: 'redos-nested-groups',
-    description: 'Doubly nested quantified groups: ((a+)+) — guaranteed catastrophic',
-    pattern: /\(\([^)]{0,40}\)[+*]\)[+*]/,
-  },
-  {
-    id: 'redos-alternation-overlap',
-    description: 'Overlapping alternation under quantifier: (a|a)+ — ambiguous NFA paths',
-    // Detect repeated identical alternatives under a quantifier
-    pattern: /\(([^|()]{1,20})\|(?:\1)(?:\|[^|()]{1,20}){0,5}\)[+*?]{1,2}/,
-  },
-  {
-    id: 'redos-star-plus-concat',
-    description: '(x*x)+ pattern — triggers super-linear backtracking',
-    pattern: /\([^)]{0,10}\*[^)]{0,10}\)[+*]/,
-  },
-  {
-    id: 'redos-dot-star-greedy',
-    description: '(.*){n,} or (.+){n,} — repeated greedy dot quantifiers',
-    pattern: /\(\.[*+]\)\{?\d/,
-  },
-  {
-    id: 'redos-large-repetition',
-    description: 'Very large fixed or range repetition count {1000,} or {1000,n} — denial of service via backtracking',
-    // Matches { followed by 4+ digits (≥1000), then optional ,digits }
-    pattern: /\{\d{4,}(?:,\d*)?\}/,
-  },
-  {
-    id: 'redos-catastrophic-alternation',
-    description: 'Long alternation with many similar branches — polynomial backtracking risk',
-    // Heuristic: 10+ pipe-separated alternatives in a single group
-    pattern: /\([^)]{0,200}(?:\|[^|)]{0,50}){9,}\)/,
-  },
-];
-
-/* harmony default export */ const redos = (REDOS_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/nosql.js
-/**
- * NOSQL context patterns.
- *
- * Detects injection vectors specific to NoSQL databases (primarily MongoDB)
- * and JavaScript-evaluated queries.
- *
- * Attack categories:
- *   1. MongoDB query operator injection: $where, $ne, $gt, $regex, $or, $and, etc.
- *      These operators, when injected into a JSON query object, can bypass
- *      authentication or exfiltrate data without knowing passwords.
- *
- *   2. JavaScript execution: $where clauses execute arbitrary JS server-side.
- *
- *   3. Prototype pollution: __proto__, constructor.prototype — can corrupt
- *      the prototype chain of all objects in the Node.js process.
- *
- * Pattern note: MongoDB operators appear as JSON keys. In JSON, keys are
- * quoted: {"$where": ...} so the pattern must allow an optional closing
- * quote between the operator name and the colon: /\$where["'\s]*:/
- */
-
-// Shared suffix: optional closing quote/whitespace before the colon
-// Handles: $op: (bare), "$op": (JSON), '$op': (single-quoted)
-const SEP = /["'\s]*:/;
-const nosql_sep = '["\'\\s]*:';
-
-const NOSQL_PATTERNS = [
-  // ─── MongoDB $ operator injection ────────────────────────────────────────
-  {
-    id: 'nosql-where-operator',
-    description: '$where — executes arbitrary JavaScript server-side in MongoDB',
-    pattern: new RegExp(`\\$where${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-ne-operator',
-    description: '$ne — "not equal" operator used to bypass equality checks',
-    pattern: new RegExp(`\\$ne${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-gt-operator',
-    description: '$gt — "greater than" used to bypass password/value checks',
-    pattern: new RegExp(`\\$gte?${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-lt-operator',
-    description: '$lt / $lte — "less than" bypass variants',
-    pattern: new RegExp(`\\$lte?${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-regex-operator',
-    description: '$regex — can be used to extract data character by character (blind injection)',
-    pattern: new RegExp(`\\$regex${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-or-operator',
-    description: '$or — logical OR; used to create always-true conditions',
-    pattern: new RegExp(`\\$or${nosql_sep}\\s*\\[`, 'i'),
-  },
-  {
-    id: 'nosql-and-operator',
-    description: '$and — logical AND operator injection',
-    pattern: new RegExp(`\\$and${nosql_sep}\\s*\\[`, 'i'),
-  },
-  {
-    id: 'nosql-nor-operator',
-    description: '$nor — logical NOR operator injection',
-    pattern: new RegExp(`\\$nor${nosql_sep}\\s*\\[`, 'i'),
-  },
-  {
-    id: 'nosql-exists-operator',
-    description: '$exists — can enumerate fields to determine schema',
-    pattern: new RegExp(`\\$exists${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-in-operator',
-    description: '$in — matches any value in a list; can enumerate values',
-    pattern: new RegExp(`\\$in${nosql_sep}\\s*\\[`, 'i'),
-  },
-  {
-    id: 'nosql-expr-operator',
-    description: '$expr — allows aggregation expressions in queries (MongoDB 3.6+)',
-    pattern: new RegExp(`\\$expr${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-function-operator',
-    description: '$function — executes arbitrary JavaScript in MongoDB 4.4+',
-    pattern: new RegExp(`\\$function${nosql_sep}`, 'i'),
-  },
-  {
-    id: 'nosql-accumulator-operator',
-    description: '$accumulator — custom aggregation with arbitrary JS execution',
-    pattern: new RegExp(`\\$accumulator${nosql_sep}`, 'i'),
-  },
-  // ─── Prototype pollution ─────────────────────────────────────────────────
-  {
-    id: 'nosql-proto-pollution',
-    description: '__proto__ — prototype pollution via object key injection',
-    pattern: /__proto__/,
-  },
-  {
-    id: 'nosql-constructor-prototype',
-    description: 'constructor.prototype — alternative prototype pollution vector (dot notation or JSON key)',
-    // Matches dot-notation (obj.constructor.prototype) and JSON key adjacency
-    // ("constructor": {"prototype": ...})
-    pattern: /constructor[\s"':.,{\[]*prototype/i,
-  },
-  {
-    id: 'nosql-proto-bracket',
-    description: '["__proto__"] — bracket-notation prototype pollution',
-    pattern: /\[["']__proto__["']\]/,
-  },
-];
-
-/* harmony default export */ const nosql = (NOSQL_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/contexts/log.js
-/**
- * LOG context patterns.
- *
- * Detects injection vectors that are dangerous when a string is written
- * to a log file, passed to a logging framework, or interpolated into
- * a log message that will be parsed or displayed.
- *
- * Attack categories:
- *   1. CRLF injection — injects fake log lines by embedding newlines
- *   2. Log4Shell (CVE-2021-44228) — ${jndi:...} triggers JNDI lookup in Log4j
- *   3. SSTI in log templates — {{...}}, #{...} trigger template evaluation
- *      if the log message is passed through a template engine
- *   4. Null byte injection — truncates log entries in some implementations
- *   5. ANSI escape injection — manipulates terminal output when logs are
- *      tailed in a terminal (colour codes, cursor movement, etc.)
- *
- * Note: Newline characters (\n, \r) will produce false positives for
- * multi-line legitimate values. Use this context only for single-line
- * log field values (usernames, IDs, request parameters, etc.).
- */
-
-const LOG_PATTERNS = [
-  // ─── CRLF / newline injection ─────────────────────────────────────────────
-  {
-    id: 'log-crlf-injection',
-    description: 'CRLF injection: literal \\r or \\n embeds fake log lines',
-    pattern: /[\r\n]/,
-  },
-  {
-    id: 'log-url-encoded-crlf',
-    description: 'URL-encoded CRLF: %0d, %0a, %0D, %0A — decoded by some log parsers',
-    pattern: /%0[dDaA]/,
-  },
-  {
-    id: 'log-unicode-newline',
-    description: 'Unicode newline variants: U+2028 (line separator), U+2029 (paragraph separator)',
-    pattern: /[\u2028\u2029]/,
-  },
-
-  // ─── Log4Shell / JNDI injection (CVE-2021-44228) ─────────────────────────
-  {
-    id: 'log-log4shell-jndi',
-    description: 'Log4Shell: ${jndi:...} triggers remote code execution in Apache Log4j',
-    pattern: /\$\{jndi\s*:/i,
-  },
-  {
-    id: 'log-log4shell-obfuscated',
-    description: 'Obfuscated Log4Shell: ${::-j}... lookup-bypass prefix used to evade WAF detection',
-    // ${::- is the Log4j lookup-bypass escape sequence; presence alone is suspicious
-    pattern: /\$\{::-/,
-  },
-  {
-    id: 'log-log4j-lookup',
-    description: 'Log4j lookup syntax: ${env:...}, ${sys:...}, ${ctx:...} — data exfiltration',
-    pattern: /\$\{(?:env|sys|ctx|main|map|sd|web|docker|k8s|spring)\s*:/i,
-  },
-
-  // ─── Server-Side Template Injection (SSTI) in log messages ───────────────
-  {
-    id: 'log-ssti-double-brace',
-    description: 'SSTI double-brace: {{expression}} — Jinja2, Twig, Handlebars, etc.',
-    pattern: /\{\{[\s\S]{0,80}\}\}/,
-  },
-  {
-    id: 'log-ssti-hash-brace',
-    description: 'SSTI hash-brace: #{expression} — Thymeleaf, Velocity, Ruby ERB',
-    pattern: /#\{[\s\S]{0,80}\}/,
-  },
-  {
-    id: 'log-ssti-dollar-brace',
-    description: 'SSTI/EL injection: ${expression with operators or method calls} — JSP EL, Freemarker, SpEL',
-    // Require that the ${...} content looks like an expression, not a plain variable name.
-    // Flags if the content contains: . ( * + operators, or known SSTI keywords.
-    // This avoids flagging ${PATH}, ${HOME} etc. (plain shell variables).
-    pattern: /\$\{[^}]*(?:\.|\(|\*|\+|\bclass\b|\bruntime\b|\bprocess\b|\bexec\b)[^}]{0,80}\}/i,
-  },
-  {
-    id: 'log-ssti-percent-tag',
-    description: 'SSTI ERB/ASP tag: <%= expression %> — Ruby ERB, ASP',
-    pattern: /<%=[\s\S]{0,80}%>/,
-  },
-
-  // ─── Null byte ────────────────────────────────────────────────────────────
-  {
-    id: 'log-null-byte',
-    description: 'Null byte: \\x00 or %00 — can truncate log entries in C-backed loggers',
-    pattern: /\x00|%00/,
-  },
-
-  // ─── ANSI escape injection ────────────────────────────────────────────────
-  {
-    id: 'log-ansi-escape',
-    description: 'ANSI escape sequence: ESC[ — can manipulate terminal output when logs are tailed',
-    pattern: /\x1b\[/,
-  },
-];
-
-/* harmony default export */ const contexts_log = (LOG_PATTERNS);
-
-;// CONCATENATED MODULE: ./node_modules/is-unsafe/src/index.js
-/**
- * is-unsafe v2
- *
- * Zero-dependency, DOM-free, pure predicate for detecting unsafe strings
- * across HTML, XML, SVG, SQL, SQL-STRICT, SHELL, REDOS, NOSQL, and LOG contexts.
- *
- * v2 change: contexts are imported as named pattern arrays rather than resolved
- * via a string-keyed registry. This makes each context independently
- * tree-shakeable — bundlers can drop any context you never import.
- *
- * @module is-unsafe
- */
-
-// ─── Context pattern arrays (named exports) ────────────────────────────────
-// Import only the ones you need. Each is independently tree-shakeable.
-
-
-
-
-
-
-
-
-
-
-// SQL-STRICT needs a quoted identifier because of the hyphen
-
-
-
-// Markup contexts are also matched against an entity-decoded copy of the input,
-// because browsers decode HTML character references before interpreting a URL
-// scheme (e.g. javascript&#58;… is a javascript: URL).
-
-
-// ─── VALID_CONTEXTS convenience re-export ─────────────────────────────────
-// Importing this pulls in ALL contexts. Use it only when you need all of them
-// (e.g. for validation UI, tooling, or exhaustive audits).
-// If you only need a subset, import the named contexts directly instead.
-
-
-
-
-
-
-
-
-
-
-// ─── Attach labels to named contexts ──────────────────────────────────────
-// Each built-in PatternList carries its canonical name so matchList can read
-// list.label directly — no registry lookup needed at match time.
-// Custom PatternLists default to 'CUSTOM' unless the caller sets list.label.
-
-html.label       = 'HTML';
-xml.label        = 'XML';
-svg.label        = 'SVG';
-
-// Markup contexts: also test an entity-decoded copy (see util/decode-entities.js).
-// Non-markup contexts (SQL, SHELL, LOG, …) are matched byte-for-byte as supplied.
-html.decodeEntities = true;
-xml.decodeEntities  = true;
-svg.decodeEntities  = true;
-sql.label        = 'SQL';
-sql_strict.label = 'SQL-STRICT';
-shell.label      = 'SHELL';
-redos.label      = 'REDOS';
-nosql.label      = 'NOSQL';
-contexts_log.label        = 'LOG';
-
-const VALID_CONTEXTS = Object.freeze({
-  HTML: html,
-  XML: xml,
-  SVG: svg,
-  SQL: sql,
-  'SQL-STRICT': sql_strict,
-  SHELL: shell,
-  REDOS: redos,
-  NOSQL: nosql,
-  LOG: contexts_log,
-});
-
-// ─── Types ────────────────────────────────────────────────────────────────
-
-/**
- * @typedef {{ id: string, description: string, pattern: RegExp }} Rule
- */
-
-/**
- * @typedef {Rule[]} PatternList
- */
-
-/**
- * @typedef {Object} MatchResult
- * @property {string} context     - Label identifying which context matched ('HTML', 'CUSTOM', etc.)
- * @property {string} id          - Rule identifier
- * @property {string} description - Human-readable description of what was matched
- * @property {RegExp} pattern     - The pattern that matched
- */
-
-// ─── Internal helpers ──────────────────────────────────────────────────────
-
-/**
- * @param {unknown} value
- */
-function assertString(value) {
-  if (typeof value !== 'string') {
-    throw new TypeError(
-      `is-unsafe: first argument must be a string, got ${typeof value}`
-    );
-  }
-}
-
-/**
- * @param {unknown} context
- */
-function assertContext(context) {
-  if (context instanceof RegExp) return;
-
-  if (Array.isArray(context)) {
-    if (context.length === 0) {
-      throw new TypeError('is-unsafe: context must not be an empty array');
-    }
-    // Detect array-of-arrays vs flat pattern list
-    if (Array.isArray(context[0])) {
-      // Array of PatternLists
-      for (const list of context) {
-        if (!Array.isArray(list) || list.length === 0) {
-          throw new TypeError(
-            'is-unsafe: each context in the array must be a non-empty pattern array (PatternList)'
-          );
-        }
-      }
-    }
-    // else: flat PatternList — trust it, no deep validation needed
-    return;
-  }
-
-  throw new TypeError(
-    `is-unsafe: second argument must be a PatternList (e.g. HTML), ` +
-    `an array of PatternLists (e.g. [HTML, XML]), or a RegExp. Got: ${typeof context}`
-  );
-}
-
-/**
- * Normalise any valid context arg into an array of PatternLists.
- *
- * @param {Rule[]|Rule[][]|RegExp} context
- * @returns {{ lists: Rule[][]|null, regex: RegExp|null }}
- */
-function normalise(context) {
-  if (context instanceof RegExp) return { lists: null, regex: context };
-  // Distinguish PatternList (array of rule objects) from array of PatternLists
-  if (Array.isArray(context[0])) return { lists: context, regex: null };
-  return { lists: [context], regex: null };
-}
-
-/**
- * For markup contexts, return an entity-decoded copy of `value` to test
- * alongside the raw input, or null when there is nothing extra to test.
- *
- * @param {string} value
- * @param {Rule[]} list
- * @returns {string|null}
- */
-function decodedCopy(value, list) {
-  if (!list.decodeEntities) return null;
-  const decoded = decodeEntities(value);
-  return decoded === value ? null : decoded;
-}
-
-/**
- * Test value against a single PatternList. Returns the first MatchResult or null.
- *
- * @param {string} value
- * @param {Rule[]} list
- * @returns {MatchResult|null}
- */
-function matchList(value, list) {
-  const label = list.label ?? 'CUSTOM';
-  const decoded = decodedCopy(value, list);
-  for (const rule of list) {
-    if (rule.pattern.test(value) || (decoded !== null && rule.pattern.test(decoded))) {
-      return { context: label, id: rule.id, description: rule.description, pattern: rule.pattern };
-    }
-  }
-  return null;
-}
-
-// ─── Public API ───────────────────────────────────────────────────────────
-
-/**
- * Returns `true` if `value` is unsafe in the given context(s), `false` otherwise.
- *
- * @param {string} value - The string to test
- * @param {PatternList | PatternList[] | RegExp} context
- *   - A PatternList imported from is-unsafe (e.g. `HTML`, `XML`)
- *   - An array of PatternLists — returns true if unsafe in **any** of them
- *   - A custom RegExp — returns true if the pattern matches
- * @returns {boolean}
- *
- * @example
- * import { isUnsafe, HTML, SQL } from 'is-unsafe';
- *
- * isUnsafe('<script>alert(1)</script>', HTML)       // true
- * isUnsafe('hello world', HTML)                     // false
- * isUnsafe('value', [HTML, SQL])                    // false
- * isUnsafe('value', /my-pattern/i)                  // false
- */
-function isUnsafe(value, context) {
-  assertString(value);
-  assertContext(context);
-
-  const { lists, regex } = normalise(context);
-
-  if (regex) return regex.test(value);
-
-  for (const list of lists) {
-    if (matchList(value, list) !== null) return true;
-  }
-  return false;
-}
-
-/**
- * Like `isUnsafe`, but returns the first `MatchResult` describing **why**
- * the value was flagged, or `null` if it is safe.
- *
- * @param {string} value
- * @param {PatternList | PatternList[] | RegExp} context
- * @returns {MatchResult|null}
- *
- * @example
- * import { whyUnsafe, HTML } from 'is-unsafe';
- *
- * whyUnsafe('<script>alert(1)</script>', HTML)
- * // { context: 'HTML', id: 'html-script-open', description: '...', pattern: /.../ }
- */
-function whyUnsafe(value, context) {
-  assertString(value);
-  assertContext(context);
-
-  const { lists, regex } = normalise(context);
-
-  if (regex) {
-    return regex.test(value)
-      ? { context: 'CUSTOM', id: 'custom-regex', description: 'Matched caller-supplied pattern', pattern: regex }
-      : null;
-  }
-
-  for (const list of lists) {
-    const result = matchList(value, list);
-    if (result !== null) return result;
-  }
-  return null;
-}
-
-/**
- * Returns **all** matching rules across the given context(s), or an empty
- * array if the value is safe. Useful for comprehensive auditing.
- *
- * @param {string} value
- * @param {PatternList | PatternList[] | RegExp} context
- * @returns {MatchResult[]}
- */
-function allUnsafe(value, context) {
-  assertString(value);
-  assertContext(context);
-
-  const { lists, regex } = normalise(context);
-  const results = [];
-
-  if (regex) {
-    if (regex.test(value)) {
-      results.push({ context: 'CUSTOM', id: 'custom-regex', description: 'Matched caller-supplied pattern', pattern: regex });
-    }
-    return results;
-  }
-
-  for (const list of lists) {
-    const label = list.label ?? 'CUSTOM';
-    const decoded = decodedCopy(value, list);
-    for (const rule of list) {
-      if (rule.pattern.test(value) || (decoded !== null && rule.pattern.test(decoded))) {
-        results.push({ context: label, id: rule.id, description: rule.description, pattern: rule.pattern });
-      }
-    }
-  }
-
-  return results;
-}
-
-
-/* harmony default export */ const src = ((/* unused pure expression or super */ null && (isUnsafe)));
-
 ;// CONCATENATED MODULE: ./node_modules/fast-xml-parser/src/xmlparser/OrderedObjParser.js
 
 ///@ts-check
-
-
 
 
 
@@ -83935,7 +79557,6 @@ class OrderedObjParser {
     this.ignoreAttributesFn = ignoreAttributes_getIgnoreAttributesFn(this.options.ignoreAttributes)
     this.entityExpansionCount = 0;
     this.currentExpandedLength = 0;
-    this.doctypefound = false;
     let namedEntities = { ...XML };
     if (this.options.entityDecoder) {
       this.entityDecoder = this.options.entityDecoder
@@ -83949,12 +79570,7 @@ class OrderedObjParser {
           maxTotalExpansions: this.options.processEntities.maxTotalExpansions,
           maxExpandedLength: this.options.processEntities.maxExpandedLength,
           applyLimitsTo: this.options.processEntities.appliesTo,
-        },
-        // onExternalEntity: (name, value) => isUnsafe(value) ? 'block' : 'allow',
-        onInputEntity: (name, value) =>
-          //TODO: VALID_CONTEXTS.HTML should be set only if this.options.htmlEntities
-          isUnsafe(value, [html, xml]) ? ENTITY_ACTION.BLOCK : ENTITY_ACTION.ALLOW,
-
+        }
         //postCheck: resolved => resolved
       });
     }
@@ -84131,15 +79747,7 @@ function buildAttributesMap(attrStr, jPath, tagName, force = false) {
   }
 }
 const parseXml = function (xmlData) {
-  const options = this.options;
-  const crlfPositions = options.captureMetaData ? [] : undefined;
-  xmlData = xmlData.replace(/\r\n?/g, options.captureMetaData ? (newline, index) => {
-    if (newline.length === 2) {
-      // Store the position after earlier CRLF pairs have been normalized.
-      crlfPositions.push(index - crlfPositions.length);
-    }
-    return "\n";
-  } : "\n");
+  xmlData = xmlData.replace(/\r\n?/g, "\n"); //TODO: remove this line
   const xmlObj = new XmlNode('!xml');
   let currentNode = xmlObj;
   let textData = "";
@@ -84151,7 +79759,7 @@ const parseXml = function (xmlData) {
   // Reset entity expansion counters for this document
   this.entityExpansionCount = 0;
   this.currentExpandedLength = 0;
-  this.doctypefound = false;
+  const options = this.options;
   const docTypeReader = new DocTypeReader(options.processEntities);
   const xmlLen = xmlData.length;
   for (let i = 0; i < xmlLen; i++) {//for each char in XML data
@@ -84191,12 +79799,7 @@ const parseXml = function (xmlData) {
         this.matcher.pop();
         this.isCurrentNodeStopNode = false; // Reset flag when closing tag
 
-        //a closing tag with no matching opening tag leaves the stack empty
-        currentNode = this.tagsNodeStack.pop() || xmlObj;//avoid recursion, set the parent tag scope
-
-        if (options.captureMetaData && currentNode) {
-          currentNode.addEndIndex(getOriginalIndex(closeIndex + 1, crlfPositions));
-        }
+        currentNode = this.tagsNodeStack.pop();//avoid recursion, set the parent tag scope
         textData = "";
         i = closeIndex;
       } else if (c1 === 63) { //'?'
@@ -84221,13 +79824,7 @@ const parseXml = function (xmlData) {
           if (tagData.tagName !== tagData.tagExp && tagData.attrExpPresent && options.ignoreAttributes !== true) {
             childNode[":@"] = attsMap
           }
-          const startIndex = options.captureMetaData ? getOriginalIndex(i, crlfPositions) : i;
-          this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
-
-          if (options.captureMetaData) {
-            // closeIndex points at '?' of the closing '?>'
-            currentNode.addEndIndex(getOriginalIndex(tagData.closeIndex + 2, crlfPositions));
-          }
+          this.addChild(currentNode, childNode, this.readonlyMatcher, i);
         }
 
 
@@ -84246,8 +79843,6 @@ const parseXml = function (xmlData) {
         i = endIndex;
       } else if (c1 === 33
         && xmlData.charCodeAt(i + 2) === 68) { //'!D'
-        if (this.doctypefound) throw new Error("Multiple DOCTYPE declarations found.");
-        this.doctypefound = true;
         const result = docTypeReader.readDocType(xmlData, i);
         this.entityDecoder.addInputEntities(result.entities);
         i = result.i;
@@ -84358,7 +79953,7 @@ const parseXml = function (xmlData) {
           this.isCurrentNodeStopNode = this.isItStopNode();
         }
 
-        const startIndex = options.captureMetaData ? getOriginalIndex(i, crlfPositions) : i;
+        const startIndex = i;
         if (this.isCurrentNodeStopNode) {
           let tagContent = "";
 
@@ -84392,10 +79987,6 @@ const parseXml = function (xmlData) {
           this.isCurrentNodeStopNode = false; // Reset flag
 
           this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
-
-          if (options.captureMetaData) {
-            currentNode.addEndIndex(getOriginalIndex(i + 1, crlfPositions));
-          }
         } else {
           //selfClosing tag
           if (isSelfClosing) {
@@ -84406,10 +79997,6 @@ const parseXml = function (xmlData) {
               childNode[":@"] = prefixedAttrs;
             }
             this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
-
-            if (options.captureMetaData) {
-              currentNode.addEndIndex(getOriginalIndex(closeIndex + 1, crlfPositions));
-            }
             this.matcher.pop(); // Pop self-closing tag
             this.isCurrentNodeStopNode = false; // Reset flag
           }
@@ -84419,10 +80006,6 @@ const parseXml = function (xmlData) {
               childNode[":@"] = prefixedAttrs;
             }
             this.addChild(currentNode, childNode, this.readonlyMatcher, startIndex);
-
-            if (options.captureMetaData) {
-              currentNode.addEndIndex(getOriginalIndex(result.closeIndex + 1, crlfPositions));
-            }
             this.matcher.pop(); // Pop unpaired tag
             this.isCurrentNodeStopNode = false; // Reset flag
             i = result.closeIndex;
@@ -84452,17 +80035,6 @@ const parseXml = function (xmlData) {
     }
   }
   return xmlObj.child;
-}
-
-function getOriginalIndex(index, crlfPositions) {
-  let low = 0;
-  let high = crlfPositions.length;
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    if (crlfPositions[middle] < index) low = middle + 1;
-    else high = middle;
-  }
-  return index + low;
 }
 
 function addChild(currentNode, childNode, matcher, startIndex) {
@@ -84643,8 +80215,6 @@ function readStopNodeData(xmlData, tagName, i) {
   const startIndex = i;
   // Starting at 1 since we already have an open tag
   let openTagCount = 1;
-  let lenient = false; // set once a quote-aware tag scan fails
-  let nextGt = -1; // cached index of the next '>'
 
   const xmllen = xmlData.length;
   for (; i < xmllen; i++) {
@@ -84676,29 +80246,14 @@ function readStopNodeData(xmlData, tagName, i) {
         const closeIndex = findClosingIndex(xmlData, "]]>", i, "StopNode is not closed.") - 2;
         i = closeIndex;
       } else {
-        const tagData = lenient ? undefined : readTagExp(xmlData, i, false);
+        const tagData = readTagExp(xmlData, i, false)
 
         if (tagData) {
-          const openTagName = tagData.tagName;
+          const openTagName = tagData && tagData.tagName;
           if (openTagName === tagName && tagData.tagExp[tagData.tagExp.length - 1] !== "/") {
             openTagCount++;
           }
           i = tagData.closeIndex;
-        } else {
-          // no closing '>'. use lenient approach to find '<' instead of readTagExp, to avoid repeated rescans.
-          lenient = true;
-          if (nextGt < i) {
-            nextGt = xmlData.indexOf(">", i);
-            if (nextGt === -1) return; // no '>' left, so no closing tag can follow
-          }
-          const nextLt = xmlData.indexOf("<", i + 1);
-          if (nextLt === -1 || nextLt > nextGt) { // looks like a real tag
-            const exp = xmlData.substring(i + 1, nextGt);
-            const sep = exp.search(/\s/);
-            const name = sep === -1 ? exp : exp.substring(0, sep);
-            if (name === tagName && exp[exp.length - 1] !== "/") openTagCount++;
-            i = nextGt;
-          } // else: treat this '<' as plain text
         }
       }
     }
@@ -84932,7 +80487,6 @@ function isLeafTag(obj, options) {
   return false;
 }
 ;// CONCATENATED MODULE: ./node_modules/fast-xml-parser/src/xmlparser/XMLParser.js
-/* global Uint8Array */
 
 
 
@@ -84953,12 +80507,7 @@ class XMLParser {
      */
     parse(xmlData, validationOption) {
         if (typeof xmlData !== "string" && xmlData.toString) {
-            if (xmlData instanceof Uint8Array &&
-                !(typeof Buffer !== "undefined" && Buffer.isBuffer(xmlData))) {
-                xmlData = new TextDecoder("utf-8", { ignoreBOM: true }).decode(xmlData);
-            } else {
-                xmlData = xmlData.toString();
-            }
+            xmlData = xmlData.toString();
         } else if (typeof xmlData !== "string") {
             throw new Error("XML data is accepted in String or Bytes[] form.")
         }
